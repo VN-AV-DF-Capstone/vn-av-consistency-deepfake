@@ -204,6 +204,71 @@ def test_mechfake_and_diagnostic_rows_and_random_partials(tmp_path):
     assert lengths and all(0.2 - 1e-6 <= x <= 3.0 + 1e-6 for x in lengths)
 
 
+def test_parallel_sessions_merge_into_one_output(tmp_path):
+    from vn_av_df.generation import merge_outputs
+
+    root = tmp_path / "clean"
+    clean_bundle(root, [(f"s{i}", f"p{i // 2}") for i in range(6)])
+    mech = ["mech_blend", "mech_warp"]
+    base = {
+        "seed": 42,
+        "clean_dataset": str(root),
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.2, 3.0],
+            "crf": 18,
+            "max_side": 640,
+            "generators_by_split": {s: ["wav2lip_gan", *mech] for s in ("train", "validation")}
+            | {"test": ["wav2lip_gan", "diag_global"]},
+        },
+    }
+
+    def session(name, generators):
+        # Phiên Kaggle riêng: tự lập plan (cùng seed → trùng), output riêng.
+        cfg = {
+            **base,
+            "plan": str(tmp_path / name / "plan.json"),
+            "generated_dataset": str(tmp_path / name / "out"),
+            "generation_generators": generators,
+        }
+        make_plan(cfg)
+        assert generate(cfg, paint_generator)["status"] == "partial"
+        return Path(cfg["plan"]), Path(cfg["generated_dataset"])
+
+    gpu = session("gpu", ["wav2lip_gan"])
+    cpu = session("cpu", [*mech, "diag_global"])
+    assert read_json(gpu[0]) == read_json(cpu[0])
+    merged = {
+        **base,
+        "plan": str(tmp_path / "merged/plan.json"),
+        "generated_dataset": str(tmp_path / "merged/out"),
+    }
+    jobs = read_json(gpu[0])["jobs"]
+    assert merge_outputs(merged, [gpu, cpu])["pairs"] == len(jobs)
+    log = read_json(Path(merged["generated_dataset"]) / "generation.json")
+    assert set(log["provenance"]) == {"wav2lip_gan", *mech, "diag_global"}
+    assert len(log["sessions"]) == 2
+    # Đủ cặp: generate chỉ ghi candidates/review, không sinh lại cặp nào.
+    done = generate(merged, paint_generator)
+    assert done["status"] == "complete"
+    finalize(merged)
+    bundle = load_dataset(merged["generated_dataset"], verify_media=True)
+    assert {r["generator"] for r in bundle} >= {*mech, "diag_global", "none"}
+    assert all(
+        r["box_sample_id"] in {x["sample_id"] for x in bundle}
+        for r in bundle
+        if r.get("box_sample_id")
+    )
+    # Không gộp vào thư mục đã có dữ liệu, không gộp output của plan khác.
+    with pytest.raises(ValueError, match="not empty"):
+        merge_outputs(merged, [gpu, cpu])
+    other = {**base, "seed": 7, "plan": str(tmp_path / "other.json")}
+    make_plan(other)
+    bad = {**merged, "generated_dataset": str(tmp_path / "bad")}
+    with pytest.raises(ValueError, match="different plans"):
+        merge_outputs(bad, [gpu, (Path(other["plan"]), cpu[1])])
+
+
 def test_generation_stops_at_deadline_and_resumes_in_parallel(tmp_path):
     import time
 

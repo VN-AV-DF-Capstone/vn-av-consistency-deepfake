@@ -415,3 +415,35 @@ def test_generation_notebook_uses_edited_part_and_generator_settings(
     state["GENERATORS"] = ["mech_vae"]
     with pytest.raises(ValueError, match="Không có GPU"):
         exec(sources["generate-config"], state)
+
+
+def test_generation_notebook_merges_parallel_session_outputs(tmp_path, monkeypatch):
+    import vn_av_df.generation as generation
+
+    sources, state, calls = notebook_config_state("generate", tmp_path, monkeypatch)
+    clean = tmp_path / "clean" / "vn-av-df-data-part1"
+    clean.mkdir(parents=True)
+    (clean / "manifest.jsonl").write_text("")
+    state.update(CLEAN_PART=clean, DEVICE="cuda", GENERATORS=["musetalk_1_5", "mech_vae"])
+    state["settings"].ROOT = tmp_path
+    previous = []
+    for name in ("gpu", "cpu"):  # Output hai notebook chạy song song, cùng cấu trúc repo.
+        folder = tmp_path / "input" / name / "vn-av-df-forensics"
+        (folder / "generation/plans").mkdir(parents=True)
+        (folder / "generation/plans/vn-av-df-data-part1.json").write_text("{}")
+        (folder / "datasets/vn-av-df-data/vn-av-df-data-part1").mkdir(parents=True)
+        previous.append(folder)
+    merged = []
+    monkeypatch.setattr(generation, "merge_outputs", lambda cfg, pairs: merged.append(pairs))
+    state["PREVIOUS_OUTPUT"] = previous
+    exec(sources["generate-config"], state)
+    # Mỗi phiên một cặp (plan, output), đúng thứ tự PREVIOUS_OUTPUT.
+    assert [[p.relative_to(folder) for p in pair] for folder, pair in zip(previous, merged[0])] == [
+        [
+            Path("generation/plans/vn-av-df-data-part1.json"),
+            Path("datasets/vn-av-df-data/vn-av-df-data-part1"),
+        ]
+    ] * 2
+    state["PREVIOUS_OUTPUT"] = [*previous, tmp_path / "missing"]
+    with pytest.raises(AssertionError, match="PREVIOUS_OUTPUT"):
+        exec(sources["generate-config"], state)

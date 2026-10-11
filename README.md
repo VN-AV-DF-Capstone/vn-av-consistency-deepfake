@@ -94,21 +94,22 @@ Thiết kế **2×2**:
 
 1. **Push code lên GitHub** (notebook clone `REPO_URL`), upload part sạch thành `vn-av-df-clean-partN`; trong [generate.ipynb](notebooks/generate.ipynb) đặt `PART`, `CLEAN_PART`.
 2. **Chạy thử trước:** `GENERATORS = "all"`, `CLIPS_PER_SPLIT = 2` (2 parent mỗi split, ~20 phút) để bắt lỗi trước khi chạy thật. Output chạy thử **không** dùng làm `PREVIOUS_OUTPUT` cho bản thật (plan khác).
-3. **Chạy thật** (`CLIPS_PER_SPLIT = 0`) theo 3 phiên. Mọi phiên giữ nguyên mọi thông số khác (plan khoá cấu hình, lệch là báo lỗi); chỉ đổi 2 dòng:
+3. **Chạy thật** (`CLIPS_PER_SPLIT = 0`): phiên 1 và 2 chạy **song song** trên **hai notebook** (notebook `generate` và bản *Copy & Edit* của nó, vd. `generate-cpu`), phiên 3 gộp hai output rồi sinh nốt. Mọi phiên giữ nguyên mọi thông số khác (plan khoá cấu hình, lệch là báo lỗi); chỉ đổi 2 dòng:
 
-   | Phiên | Accelerator | `GENERATORS` | `PREVIOUS_OUTPUT` | Part1 (ước tính) |
-   |---|---|---|---|---|
-   | 1 | GPU T4 ×2 | `["wav2lip_gan"]` | `None` (tạo plan) | 804 cặp, ~8 h |
-   | 2 | **None** (CPU, không trừ quota GPU) | `["mech_blend", "mech_lowres", "mech_warp", "mech_temporal", "diag_paste", "diag_global"]` | Output phiên 1 | 1740 + 280 cặp |
-   | 3 | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | Output phiên 2 | 280 + 435 cặp |
+   | Phiên | Notebook | Accelerator | `GENERATORS` | `PREVIOUS_OUTPUT` | Part1 (ước tính) |
+   |---|---|---|---|---|---|
+   | 1 | `generate` | GPU T4 ×2 | `["wav2lip_gan"]` | `None` | 804 cặp, ~8 h |
+   | 2 (cùng lúc với 1) | `generate-cpu` | **None** (CPU, không trừ quota GPU) | `["mech_blend", "mech_lowres", "mech_warp", "mech_temporal", "diag_paste", "diag_global"]` | `None` | 1740 + 280 cặp |
+   | 3 (sau khi 1, 2 xong) | `generate` | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | `[output phiên 1, output phiên 2]` | 280 + 435 cặp |
 
-   - Phiên 1 phải chạy trước: Wav2Lip đứng đầu plan và sinh kèm real/sham cho mọi parent.
-   - **Không đổi code giữa các phiên** của cùng output: `generation.json` khoá hash `generation.py`, `render.py` (và `mechfake.py` theo generator); đổi code → `Changed generation run`, phải sinh lại từ phiên 1.
-   - `PREVIOUS_OUTPUT`: *Add Input → Your Work* → notebook phiên trước, trỏ tới thư mục `vn-av-df-forensics` trong đó, vd. `Path("/kaggle/input/<notebook>/vn-av-df-forensics")`.
-   - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial` kèm `remaining_by_generator`: chạy lại **đúng phiên đó** với `PREVIOUS_OUTPUT` = output vừa lưu; cặp đã có được bỏ qua.
+   - Phiên 1 và 2 tự lập plan, cùng seed + part sạch nên **trùng nhau**. `PREVIOUS_OUTPUT` là danh sách → notebook **gộp** hai output (`merge_outputs`: kiểm cùng plan, cùng chữ ký code, provenance không mâu thuẫn, hash từng video) rồi sinh nốt. Một đường dẫn = sinh tiếp như cũ.
+   - Gắn output: *Add Input → Your Work* → notebook, Kaggle lấy **version mới nhất**; trỏ tới thư mục `vn-av-df-forensics` trong đó, vd. `Path("/kaggle/input/<notebook>/vn-av-df-forensics")`. Vì vậy mỗi phiên song song một notebook riêng.
+   - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial` kèm `remaining_by_generator`: chạy lại **đúng phiên đó trong notebook của nó** với `PREVIOUS_OUTPUT` = output vừa lưu (một đường dẫn); xong hết phiên 1 và 2 mới làm phiên 3.
+   - **Không đổi code từ phiên 1 đến hết phiên 3**: `generation.json` khoá hash `generation.py`, `render.py` (và `mechfake.py` theo generator); đổi code → `Changed generation run` / không gộp được, phải sinh lại.
+   - Real/sham sinh kèm Wav2Lip (phiên 1); MechFake của parent mà cặp Wav2Lip bị bỏ (không thấy mặt) bị loại khi gộp xong.
    - `DEVICE = "auto"`: không GPU thì chạy CPU với `CPU_WORKERS` (2) cặp song song; phiên CPU chỉ nhận `mech_*` trừ `mech_vae` và `diag_*`, generator khác báo lỗi ngay.
-   - Muốn gọn: `GENERATORS = "all"` qua ~2 phiên GPU (~15–17 h tổng), tốn quota GPU hơn.
-   - Chạy nền: *Save Version → Save & Run All*, Output tự lưu. Dung lượng ~0,8 MB/mẫu (part1 ~8000 mẫu ≈ 6,5 GB, dưới giới hạn 20 GB).
+   - Muốn gọn (một notebook, tuần tự): `GENERATORS = "all"` qua ~2 phiên GPU (~15–17 h), hoặc 3 phiên nối tiếp mỗi phiên `PREVIOUS_OUTPUT` = output phiên trước.
+   - Chạy nền: *Save Version → Save & Run All*, Output tự lưu (chạy tương tác không lưu Output). Dung lượng ~0,8 MB/mẫu (part1 ~8000 mẫu ≈ 6,5 GB, dưới giới hạn 20 GB).
 4. Mặc định: Wav2Lip GAN cho mọi split, MuseTalk 1.5 chỉ ở test; train chỉ `donor`, validation/test có `donor` + `source`; fake cục bộ có **độ dài ngẫu nhiên liên tục** trong `PARTIAL_RANGE_S` (0,2–3,0 s). Clip không có donor cùng `speaker_id` bị bỏ và ghi vào plan. Generator AI thật phải đứng đầu mỗi split (sinh kèm real/sham).
 5. **MechFake** (v002, train/validation, mỗi parent đủ 5 cơ chế, tiếng gốc, không cần worker):
 

@@ -230,7 +230,7 @@ def generate(cfg, generator=None):
     """Sinh bằng worker thực; giữ audio chung cho V-only, provenance và resume nghiêm ngặt.
 
     cfg["generation_generators"] (vd. ["wav2lip_gan"]) giới hạn generator của phiên này: cặp
-    của generator khác để phiên sau (PREVIOUS_GENERATION), nên mỗi phiên chỉ cài một worker.
+    của generator khác để phiên sau (PREVIOUS_OUTPUT), nên mỗi phiên chỉ cài worker cần dùng.
     """
     from vn_av_df.generators import generator_adapter
 
@@ -604,7 +604,7 @@ def generate(cfg, generator=None):
             "pairs_remaining": missing,
             "remaining_by_generator": dict(left),
             "pairs_skipped": len(skipped),
-            "next": "Save Version, attach output này làm PREVIOUS_GENERATION, chọn GENERATORS "
+            "next": "Save Version, attach output này làm PREVIOUS_OUTPUT, chọn GENERATORS "
             "theo remaining_by_generator rồi chạy tiếp",
         }
     rows = [row for result in results for row in result]
@@ -627,6 +627,54 @@ def generate(cfg, generator=None):
         "pairs_skipped": len(skipped),
         "next": "Run review then finalize; pending media is not training data",
     }
+
+
+def merge_outputs(cfg, sources):
+    """Gộp output các phiên chạy song song (cùng plan, cùng code) vào cfg["generated_dataset"].
+
+    sources: [(plan.json, thư mục output)] của từng phiên. Chỉ chép cặp đã có record (video dở
+    không record bị bỏ); candidates/review được generate ghi lại khi đủ cặp.
+    """
+    out, plan_path = Path(cfg["generated_dataset"]), Path(cfg["plan"])
+    if out.exists() and any(out.iterdir()):
+        raise ValueError(f"Merge target is not empty: {out}")
+    plans = [read_json(p) for p, _ in sources]
+    if any(p != plans[0] for p in plans[1:]):
+        raise ValueError("Outputs come from different plans; cannot merge")
+    logs = [read_json(Path(folder) / "generation.json") for _, folder in sources]
+    if any(log["signature"] != logs[0]["signature"] for log in logs[1:]):
+        raise ValueError("Outputs come from different code/plan signatures; cannot merge")
+    provenance = {}
+    for log in logs:
+        for name, info in log["provenance"].items():
+            if provenance.setdefault(name, info) != info:
+                raise ValueError(f"{name} differs between merged outputs")
+    records = {}
+    for _, folder in sources:
+        for path in sorted((Path(folder) / "records").glob("*.json")):
+            record = read_json(path)
+            if records.setdefault(path.name, (record, folder))[0] != record:
+                raise ValueError(f"Pair {path.stem} differs between merged outputs")
+    (out / "records").mkdir(parents=True)
+    (out / "clips").mkdir()
+    for name, (record, folder) in records.items():
+        for sample in record if isinstance(record, list) else []:
+            source = Path(folder) / sample["video"]
+            if sha(source) != sample["sha256"]:
+                raise ValueError(f"Generated file changed: {source}")
+            shutil.copy2(source, out / sample["video"])
+        write_json(out / "records" / name, record)
+    lock = Path(sources[0][1]) / "split-lock.json"
+    if lock.is_file():
+        shutil.copy2(lock, out / "split-lock.json")
+    sessions = sorted((s for log in logs for s in log["sessions"]), key=lambda s: s["started_unix"])
+    write_json(
+        out / "generation.json",
+        {**logs[0], "provenance": provenance, "sessions": sessions},
+    )
+    plan_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(sources[0][0], plan_path)
+    return {"merged_outputs": len(sources), "pairs": len(records)}
 
 
 def finalize(cfg):
