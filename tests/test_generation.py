@@ -178,7 +178,12 @@ def test_mechfake_and_diagnostic_rows_and_random_partials(tmp_path):
         assert mine[0]["emit_real"] and all(j["real_sample_id"] == real for j in mine[1:])
         flags = [j["fusion_subset"] for j in mine if j["generator"] in mech]
         assert flags == [] or sum(flags) == 1  # Đúng một cơ chế mỗi parent được trích đủ.
-    generate(cfg, paint_generator)
+    # Chia phiên như Kaggle: Wav2Lip trước (chỉ nạp generator đó), MechFake/chẩn đoán phiên sau.
+    first = generate({**cfg, "generation_generators": ["wav2lip_gan"]}, paint_generator)
+    assert first["status"] == "partial"
+    assert set(first["remaining_by_generator"]) == {*mech, "diag_paste"}
+    second = generate({**cfg, "generation_generators": [*mech, "diag_paste"]}, paint_generator)
+    assert second["status"] == "complete"
     finalize(cfg)
     bundle = load_dataset(cfg["generated_dataset"], verify_media=True)
     ids = {r["sample_id"]: r for r in bundle}

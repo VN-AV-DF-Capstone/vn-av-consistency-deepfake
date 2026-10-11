@@ -103,6 +103,7 @@ Thiết kế **2×2**:
    | 3 | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | Output phiên 2 | 280 + 435 cặp |
 
    - Phiên 1 phải chạy trước: Wav2Lip đứng đầu plan và sinh kèm real/sham cho mọi parent.
+   - **Không đổi code giữa các phiên** của cùng output: `generation.json` khoá hash `generation.py`, `render.py` (và `mechfake.py` theo generator); đổi code → `Changed generation run`, phải sinh lại từ phiên 1.
    - `PREVIOUS_OUTPUT`: *Add Input → Your Work* → notebook phiên trước, trỏ tới thư mục `vn-av-df-forensics` trong đó, vd. `Path("/kaggle/input/<notebook>/vn-av-df-forensics")`.
    - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial` kèm `remaining_by_generator`: chạy lại **đúng phiên đó** với `PREVIOUS_OUTPUT` = output vừa lưu; cặp đã có được bỏ qua.
    - `DEVICE = "auto"`: không GPU thì chạy CPU với `CPU_WORKERS` (2) cặp song song; phiên CPU chỉ nhận `mech_*` trừ `mech_vae` và `diag_*`, generator khác báo lỗi ngay.

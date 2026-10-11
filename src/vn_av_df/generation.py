@@ -330,7 +330,6 @@ def generate(cfg, generator=None):
             f"Pair {number + 1}/{total} [{r['split']}] {name}/{job.get('audio_mode', 'source')}: "
             f"parent {r['clip_id']} ({r.get('speaker_id') or '-'})"
         )
-        gen_info = provenance[name]
         key = fingerprint(job)[:20]
         record = out / "records" / f"{key}.json"
         if record.exists():
@@ -341,7 +340,8 @@ def generate(cfg, generator=None):
                 raise ValueError("Generated file changed")
             return previous
         if name not in active:
-            return None  # Cặp của generator để phiên khác.
+            return None  # Cặp của generator để phiên khác (chưa nạp provenance/adapter).
+        gen_info = provenance[name]
         gpu = slots.get()
         if deadline is not None and time.time() > deadline:
             slots.put(gpu)
