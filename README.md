@@ -36,7 +36,7 @@ Mọi notebook đọc input bằng **một đường dẫn đầy đủ** (copy 
 
 | Giới hạn | Ảnh hưởng | Cách làm |
 |---|---|---|
-| 12 giờ/phiên, ~30 giờ GPU/tuần, Output ≤ 20 GB | Sinh (Wav2Lip, MuseTalk, MechFake) và trích AV-HuBERT là phần tốn nhất | Một generator mỗi phiên; generate có `TIME_BUDGET_HOURS`, chạy tiếp bằng `PREVIOUS_OUTPUT`; prepare trích tiếp bằng `CACHE_INPUTS` |
+| 12 giờ/phiên, ~30 giờ GPU/tuần, Output ≤ 20 GB | Sinh (Wav2Lip, MuseTalk, MechFake) và trích AV-HuBERT là phần tốn nhất | Chia phiên theo generator, MechFake không VAE chạy phiên **CPU** (không trừ quota GPU, mục 2); generate có `TIME_BUDGET_HOURS`, chạy tiếp bằng `PREVIOUS_OUTPUT`; prepare trích tiếp bằng `CACHE_INPUTS` |
 | Dataset tạo từ Output chỉ lấy **500 file** | Cache ~6000 file/encoder, part đã sinh hàng nghìn clip | Tải Output về, ZIP ở local rồi upload thành dataset |
 | `kaggle kernels output` chỉ lấy version mới nhất, skip chậm, đứt mạng là dừng | Tải Output lớn hay lỗi | `python tools/kaggle_pull.py <owner/slug> .. "<regex>"` (bỏ qua file đã có, tự thử lại) |
 | Kaggle CLI mới cần Python ≥ 3.11 | Env dự án v002 đã là 3.11 | `python -m pip install -U kaggle`, `kaggle auth login` |
@@ -47,6 +47,7 @@ Python **3.11** (env conda `vn-av-df`, v002 nâng từ 3.10), chạy từ thư m
 
 ```powershell
 python -m pip install -e ./data_pipeline -e ".[training]"   # data, duyệt, train/test CPU, demo
+python -m pip install pytest httpx                           # (tuỳ chọn) chạy kiểm thử; hoặc dùng extra [dev]
 python data_pipeline/steps/00_setup.py                       # YuNet + Silero VAD
 python training/00_setup.py --encoder avhubert               # demo B-AVH/P2/TriCue (cần worker, mục 7)
 python training/00_setup.py --encoder dinov2                 # demo P2/TriCue
@@ -91,12 +92,36 @@ Thiết kế **2×2**:
 | **Tiếng khớp miệng** | real | fake `source`: miệng vẽ theo tiếng gốc (chỉ có artifact) |
 | **Tiếng lệch miệng** | sham: ghép tiếng thật khác của cùng người, nhãn AI = 0 | fake `donor`: miệng vẽ theo tiếng thật khác của cùng người (mối đe doạ chính) |
 
-1. Upload part sạch thành `vn-av-df-clean-partN`; trong [generate.ipynb](notebooks/generate.ipynb) đặt `PART`, `CLEAN_PART`.
-2. **Một generator mỗi phiên** (nhẹ hơn, chỉ cài worker cần dùng): phiên 1 `GENERATORS = ["wav2lip_gan"]` (sinh luôn real/sham), phiên 2 `GENERATORS = ["musetalk_1_5"]` + `PREVIOUS_OUTPUT`. Hoặc `"all"` trong một phiên. Hết giờ/còn generator chưa chạy → `status: partial` kèm `remaining_by_generator`.
-3. Mặc định: Wav2Lip GAN cho mọi split, MuseTalk 1.5 chỉ ở test; train chỉ `donor`, validation/test có `donor` + `source`; fake cục bộ có **độ dài ngẫu nhiên liên tục** trong `PARTIAL_RANGE_S` (0,2–3,0 s); `CLIPS_PER_SPLIT = 0` lấy toàn bộ (2 = chạy thử). Clip không có donor cùng `speaker_id` bị bỏ và ghi vào plan. Generator AI thật phải đứng đầu mỗi split (sinh kèm real/sham).
-4. **MechFake** (v002, train/validation): `mech_blend`, `mech_lowres`, `mech_vae` (SD-VAE ft-mse), `mech_warp`, `mech_temporal` giả vùng miệng theo cơ chế sinh, chỉ từ video thật, không cần worker (`mech_vae` dùng GPU nếu có). Mỗi parent một cơ chế được đánh `feature_scope = full` (trích đủ AV-HuBERT để train head hợp điểm); còn lại `artifact` (chỉ DINOv2, hộp miệng lấy từ real của parent qua `box_sample_id`).
-5. **Chẩn đoán E6** (chỉ test, nhãn 0): `diag_paste` (miệng thật thu 96 px rồi dán lại), `diag_global` (xử lý toàn khung lành tính + nén lại). Báo riêng trong `test.json → diagnostics`, không vào chỉ số chính.
-6. Thời gian mỗi phiên (giây/cặp theo generator) ghi vào `generation.json` → `sessions` (dùng cho bảng chi phí).
+1. **Push code lên GitHub** (notebook clone `REPO_URL`), upload part sạch thành `vn-av-df-clean-partN`; trong [generate.ipynb](notebooks/generate.ipynb) đặt `PART`, `CLEAN_PART`.
+2. **Chạy thử trước:** `GENERATORS = "all"`, `CLIPS_PER_SPLIT = 2` (2 parent mỗi split, ~20 phút) để bắt lỗi trước khi chạy thật. Output chạy thử **không** dùng làm `PREVIOUS_OUTPUT` cho bản thật (plan khác).
+3. **Chạy thật** (`CLIPS_PER_SPLIT = 0`) theo 3 phiên. Mọi phiên giữ nguyên mọi thông số khác (plan khoá cấu hình, lệch là báo lỗi); chỉ đổi 2 dòng:
+
+   | Phiên | Accelerator | `GENERATORS` | `PREVIOUS_OUTPUT` | Part1 (ước tính) |
+   |---|---|---|---|---|
+   | 1 | GPU T4 ×2 | `["wav2lip_gan"]` | `None` (tạo plan) | 804 cặp, ~8 h |
+   | 2 | **None** (CPU, không trừ quota GPU) | `["mech_blend", "mech_lowres", "mech_warp", "mech_temporal", "diag_paste", "diag_global"]` | Output phiên 1 | 1740 + 280 cặp |
+   | 3 | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | Output phiên 2 | 280 + 435 cặp |
+
+   - Phiên 1 phải chạy trước: Wav2Lip đứng đầu plan và sinh kèm real/sham cho mọi parent.
+   - `PREVIOUS_OUTPUT`: *Add Input → Your Work* → notebook phiên trước, trỏ tới thư mục `vn-av-df-forensics` trong đó, vd. `Path("/kaggle/input/<notebook>/vn-av-df-forensics")`.
+   - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial` kèm `remaining_by_generator`: chạy lại **đúng phiên đó** với `PREVIOUS_OUTPUT` = output vừa lưu; cặp đã có được bỏ qua.
+   - `DEVICE = "auto"`: không GPU thì chạy CPU với `CPU_WORKERS` (2) cặp song song; phiên CPU chỉ nhận `mech_*` trừ `mech_vae` và `diag_*`, generator khác báo lỗi ngay.
+   - Muốn gọn: `GENERATORS = "all"` qua ~2 phiên GPU (~15–17 h tổng), tốn quota GPU hơn.
+   - Chạy nền: *Save Version → Save & Run All*, Output tự lưu. Dung lượng ~0,8 MB/mẫu (part1 ~8000 mẫu ≈ 6,5 GB, dưới giới hạn 20 GB).
+4. Mặc định: Wav2Lip GAN cho mọi split, MuseTalk 1.5 chỉ ở test; train chỉ `donor`, validation/test có `donor` + `source`; fake cục bộ có **độ dài ngẫu nhiên liên tục** trong `PARTIAL_RANGE_S` (0,2–3,0 s). Clip không có donor cùng `speaker_id` bị bỏ và ghi vào plan. Generator AI thật phải đứng đầu mỗi split (sinh kèm real/sham).
+5. **MechFake** (v002, train/validation, mỗi parent đủ 5 cơ chế, tiếng gốc, không cần worker):
+
+   | Cơ chế | Làm gì | Họ generator mô phỏng |
+   |---|---|---|
+   | `mech_blend` (M1) | Trộn biến thể màu / độ nét / dịch nhỏ của chính vùng miệng | Dán–ghép (SBI, SAVe) |
+   | `mech_lowres` (M2) | Thu còn 30–70 % cạnh hộp miệng thật rồi phóng lại | GAN độ phân giải thấp (Wav2Lip) |
+   | `mech_vae` (M3, GPU) | Qua SD-VAE ft-mse, mỗi ô latent phủ 2–5 px frame | Latent (MuseTalk, LatentSync) |
+   | `mech_warp` (M4) | Uốn kết cấu miệng của khung cách ±3–25 bằng optical flow | Biến dạng (DINet) |
+   | `mech_temporal` (M5) | Chỉ vùng môi: lệch ±5–25 khung / giữ khung / đổi tốc độ | Sai thời điểm (AVPF) |
+
+   Vùng miệng từ YuNet (mép miệng, mũi), mặt nạ elip làm mềm; vùng môi hoặc nửa dưới mặt chọn ngẫu nhiên (M5 chỉ môi). Mỗi parent một cơ chế được đánh `feature_scope = full` (trích đủ AV-HuBERT để train head hợp điểm); còn lại `artifact` (chỉ DINOv2, hộp miệng lấy từ real của parent qua `box_sample_id`). Năm cơ chế của cùng parent dùng chung clip đã giải mã + điểm mặt.
+6. **Chẩn đoán E6** (chỉ test, nhãn 0): `diag_paste` (nửa dưới mặt thật thu về ≤96 px như Wav2Lip rồi dán lại; ở 640 px gần như chỉ còn viền dán), `diag_global` (thu nhỏ / làm nét / gamma toàn khung rồi nén CRF 28–35). Báo riêng trong `test.json → diagnostics`, không vào chỉ số chính.
+7. Thời gian mỗi phiên (giây/cặp theo generator) ghi vào `generation.json` → `sessions` (dùng cho bảng chi phí).
 
 Nhãn mỗi mẫu: `label` (AI), `fake_intervals`, `audio_mode` (`donor`/`source`/null), `av_mismatch_intervals` (nhãn "lệch tiếng" cho nhánh sync P2 / TriCue, không phải nhãn deepfake), `diagnostic` (mẫu E6), `feature_scope`/`box_sample_id` (MechFake).
 

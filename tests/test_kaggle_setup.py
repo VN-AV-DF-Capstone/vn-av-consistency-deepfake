@@ -390,6 +390,7 @@ def test_generation_notebook_uses_edited_part_and_generator_settings(
         CRF=20,
         MUSETALK_BATCH_SIZE=2,
         PARTIAL_RANGE_S=[0.8, 0.8],
+        DEVICE="cuda",  # Phiên Kaggle có GPU.
     )
     state["settings"].ROOT = tmp_path
     exec(sources["generate-config"], state)
@@ -406,4 +407,11 @@ def test_generation_notebook_uses_edited_part_and_generator_settings(
     assert calls == ["validate", "plan", "generator_setup"]
     state["GENERATORS"] = ["sadtalker"]
     with pytest.raises(ValueError, match="GENERATORS"):
+        exec(sources["generate-config"], state)
+    # Phiên không GPU: chỉ MechFake không VAE / chẩn đoán.
+    state.update(DEVICE="cpu", GENERATORS=["mech_blend", "mech_lowres", "mech_warp"])
+    exec(sources["generate-config"], state)
+    assert state["cfg"]["generation_generators"] == ["mech_blend", "mech_lowres", "mech_warp"]
+    state["GENERATORS"] = ["mech_vae"]
+    with pytest.raises(ValueError, match="Không có GPU"):
         exec(sources["generate-config"], state)

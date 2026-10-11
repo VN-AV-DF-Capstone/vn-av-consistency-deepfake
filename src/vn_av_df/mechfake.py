@@ -15,6 +15,8 @@ YuNet (mép miệng, mũi) nên không cần dlib. Tiếng giữ nguyên tiếng
 
 import random
 import tempfile
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,11 @@ from vn_av_df.generators import DIAGNOSTICS, MECHANISMS
 WORK = 256  # Cạnh patch xử lý (pixel) trước khi dán lại về kích thước thật.
 VAE_REPO = "stabilityai/sd-vae-ft-mse"
 _VAE = {}
+# Clip gốc đã giải mã + điểm mặt, dùng chung cho 5 cơ chế của cùng parent (các luồng GPU cùng
+# đọc; mọi bước chỉ tạo mảng mới, không sửa frame). Giữ vài clip gần nhất cho vừa RAM.
+_SOURCES = OrderedDict()
+_SOURCES_LOCK = threading.Lock()
+_SOURCES_KEEP = 4
 
 
 # ---- vùng miệng ----
@@ -257,28 +264,70 @@ def global_processing(frames, pcm, rng):
     return again[:, :h, :w], op
 
 
-def render(name, frames, pcm, rng, cfg, device="cpu"):
-    """Frame mới của cơ chế `name`; trả (frames, mô tả tham số)."""
+def source(video, max_side, model, digest):
+    """(clip đã giải mã, điểm mặt hoặc lỗi dò mặt) của parent, lấy từ bộ nhớ nếu vừa dùng."""
+    from vn_av_df.data.media import decode
+
+    key = (digest, max_side, str(model))
+    with _SOURCES_LOCK:
+        if key in _SOURCES:
+            _SOURCES.move_to_end(key)
+            return _SOURCES[key]
+    decoded = decode(video, max_side=max_side, sample_rate=48000)
+    try:
+        points = face_points(decoded["frames"], model)
+    except ValueError as exc:
+        points = exc
+    with _SOURCES_LOCK:
+        _SOURCES[key] = decoded, points
+        while len(_SOURCES) > _SOURCES_KEEP:
+            _SOURCES.popitem(last=False)
+    return decoded, points
+
+
+def render(name, frames, pcm, rng, cfg, device="cpu", points=None):
+    """Frame mới của cơ chế `name`; trả (frames, mô tả tham số). `points` = face_points đã tính."""
     if name == "diag_global":
         out, op = global_processing(frames, pcm, rng)
         return out, {"op": op}
     import cv2
 
-    region = "lower" if name == "diag_paste" else rng.choice(["lips", "lower"])
-    boxes = geometry(face_points(frames, cfg["mechfake"]["face_model"]), region)
+    if points is None:
+        points = face_points(frames, cfg["mechfake"]["face_model"])
+    if isinstance(points, Exception):
+        raise ValueError(str(points))
+    # M5 chỉ dạy sai thời điểm: lấy riêng môi, vì nửa dưới mặt của khung khác kéo theo cổ/áo lệch
+    # tư thế thành vết dán lớn (lẫn sang M1).
+    if name == "diag_paste":
+        region = "lower"
+    elif name == "mech_temporal":
+        region = "lips"
+    else:
+        region = rng.choice(["lips", "lower"])
+    boxes = geometry(points, region)
     patches = np.stack([crop(f, b) for f, b in zip(frames, boxes)])
-    detail = {"region": region}
+    # Cạnh hộp (pixel của frame): tham số M2/M3 tính theo nó, không theo WORK. Frame 640 px chỉ có
+    # hộp miệng ~50–120 px; cạnh cố định lớn hơn hộp thì thu–phóng không mất gì (mẫu fake rỗng).
+    box_px = float(np.median(boxes[:, 2]))
+    detail = {"region": region, "box_px": round(box_px, 1)}
     if name == "mech_blend":
         new = blend_source(patches, rng)
     elif name in ("mech_lowres", "diag_paste"):
-        side = 96 if name == "diag_paste" else rng.randint(48, 160)
+        if name == "diag_paste":
+            # Như Wav2Lip (mặt về 96 px): hộp nửa dưới mặt lớn hơn 96 px mới bị thu.
+            side = round(min(96.0, box_px))
+        else:
+            side = max(12, round(box_px * rng.uniform(0.3, 0.7)))
         interpolation = rng.choice([cv2.INTER_LINEAR, cv2.INTER_CUBIC])
         new = lowres(patches, side, interpolation)
         detail["side"] = side
     elif name == "mech_vae":
-        side = rng.choice([192, 224, 256, 288, 320])
+        # Mỗi ô latent (8 px của ảnh vào VAE) phủ 2–5 px frame (MuseTalk trên mặt 1080p rồi thu
+        # về 640 px: ~3 px).
+        cell = rng.uniform(2.0, 5.0)
+        side = max(64, 8 * round(box_px / cell))
         new = vae_roundtrip(patches, side, cfg["mechfake"]["vae"], device)
-        detail["side"] = side
+        detail.update(side=side, latent_cell_px=round(cell, 2))
     elif name == "mech_warp":
         offset = rng.choice((-1, 1)) * rng.randint(3, 25)
         new = warp_from(patches, offset)
@@ -335,15 +384,16 @@ class Adapter:
 
     def synthesize(self, cfg, video, audio_video, output, frames, width, height, gpu=None):
         """Đọc clip gốc, thay vùng miệng theo cơ chế, ghi FFV1 + PCM gốc (chưa nén mất mát)."""
-        from vn_av_df.data.media import decode
         from vn_av_df.data.render import write_lossless
 
-        decoded = decode(video, max_side=cfg["generation"]["max_side"], sample_rate=48000)
+        digest = sha(video)
+        model = cfg["mechfake"]["face_model"]
+        decoded, points = source(video, cfg["generation"]["max_side"], model, digest)
         if len(decoded["frames"]) != int(frames):
             raise ValueError("Decoded frame count differs from plan")
         device = cfg["mechfake"].get("device", "cpu")
         if str(device).startswith("cuda") and gpu is not None:
             device = f"cuda:{gpu}"
-        rng = random.Random(fingerprint([sha(video), self.name]))
-        out, _ = render(self.name, decoded["frames"], decoded["pcm"], rng, cfg, device)
+        rng = random.Random(fingerprint([digest, self.name]))
+        out, _ = render(self.name, decoded["frames"], decoded["pcm"], rng, cfg, device, points)
         write_lossless(out, decoded["pcm"], output)
