@@ -7,12 +7,7 @@ import torch
 
 from vn_av_df.common.runtime import read_json, write_json
 from vn_av_df.experiment import load_model, resolve_checkpoint
-from vn_av_df.features.registry import (
-    artifact_arrays,
-    combined_signature,
-    feature_arrays,
-    make_encoder,
-)
+from vn_av_df.features.registry import assemble, combined_signature, make_encoder
 from vn_av_df.metrics import intervals
 from vn_av_df.models import output_valid, pool_score
 
@@ -42,8 +37,8 @@ class Analyzer:
         self.cfg = cfg
         self.model, self.state = load_model(chosen_checkpoint(cfg), cfg["device"])
         self.architecture = self.state["model_config"]["architecture"]
-        kind = self.state["encoder_config"].get("kind", "fate")
-        encoder_cfg = cfg.get("encoders", {}).get(kind, cfg["encoder"])
+        kind = self.state["encoder_config"].get("kind")
+        encoder_cfg = cfg.get("encoders", {}).get(kind, cfg.get("encoder"))
         self.encoder = encoder or make_encoder(encoder_cfg)
         signature = self.encoder.signature
         self.artifact_encoder = None
@@ -65,15 +60,17 @@ class Analyzer:
         with tempfile.TemporaryDirectory() as folder:
             cache = Path(cache_folder or folder) / (self.encoder.signature + ".npz")
             meta = self.encoder.extract({"video": str(video)}, cache)
-            arrays, times, meta = feature_arrays(cache, meta, self.architecture)
+            artifact = None
             if self.artifact_encoder is not None:
                 extra = cache.with_name(self.artifact_encoder.signature + ".npz")
                 extra_meta = self.artifact_encoder.extract(
                     {"video": str(video), "boxes": str(cache)}, extra
                 )
-                artifact, artifact_valid = artifact_arrays(extra, extra_meta, len(arrays[0]))
-                arrays = (arrays[0], arrays[1], arrays[2] & artifact_valid, artifact)
-            tensors = [torch.as_tensor(x, device=self.cfg["device"]) for x in arrays]
+                artifact = (extra, extra_meta)
+            arrays, times, meta = assemble(self.architecture, (cache, meta), artifact)
+            tensors = [
+                None if x is None else torch.as_tensor(x, device=self.cfg["device"]) for x in arrays
+            ]
             scores = self.model(*tensors).sigmoid()
             valid = output_valid(self.model, tensors[2])
             score = pool_score(scores, valid, self.state["top_fraction"])

@@ -7,15 +7,15 @@
 | Kaggle generation | Package profile generation | MuseTalk/Python 3.10 chỉ khi chọn musetalk_1_5. |
 | Kaggle training | Profile training: các detector đã chọn | AV-HuBERT/Python 3.10 chỉ khi có model dùng encoder AV-HuBERT. |
 | Local review | Package media/review/finalize | Không cần worker generator/encoder. |
-| Local demo video mới | Inference FATE và detector checkpoints | AV-HuBERT nếu demo có P1; không cần MuseTalk. |
+| Local demo video mới | Inference detector checkpoints | AV-HuBERT cho B-AVH/P2/TriCue; không cần MuseTalk. |
 
 ## Tự chuẩn bị worker trên Kaggle
 
-Hai notebook có cell gọi [bootstrap_worker.py](bootstrap_worker.py) sau bước tải assets. Script tải Micromamba từ endpoint chính thức, tạo Python 3.10 ở `--env-root` (notebook: `WORKERS = /kaggle/temp/vn-av-df-workers`, ngoài /kaggle/working nên không tính vào Output 20 GB) và cài đúng worker; không yêu cầu Kaggle có conda từ trước và không cài fairseq/MMLab vào kernel FATE. Notebook tự gán đường dẫn interpreter vào config sau khi setup đạt.
+Hai notebook có cell gọi [bootstrap_worker.py](bootstrap_worker.py) sau bước tải assets. Script tải Micromamba từ endpoint chính thức, tạo Python 3.10 ở `--env-root` (notebook: `WORKERS = /kaggle/temp/vn-av-df-workers`, ngoài /kaggle/working nên không tính vào Output 20 GB) và cài đúng worker; không yêu cầu Kaggle có conda từ trước và không cài fairseq/MMLab vào kernel chính. Notebook tự gán đường dẫn interpreter vào config sau khi setup đạt.
 
 | Notebook | Worker tự tạo | Không cài trong bước worker |
 |---|---|---|
-| generate.ipynb | WORKERS/.venv-musetalk/bin/python nếu chọn MuseTalk | AV-HuBERT/FATE |
+| generate.ipynb | WORKERS/.venv-musetalk/bin/python nếu chọn MuseTalk | AV-HuBERT |
 | prepare.ipynb | WORKERS/.venv-avhubert/bin/python nếu `ENCODERS` có `avhubert` | MuseTalk/Wav2Lip |
 
 Bật Internet và GPU rồi chạy các cell theo thứ tự. Bootstrap tự kiểm Python, phiên bản torch, tương thích NumPy, import thư viện và phép tính CUDA nhỏ. Receipt chỉ đánh dấu ready sau khi pip check và import/CUDA probe đạt. Đây **không phải** inference thử checkpoint thật.

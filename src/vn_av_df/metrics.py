@@ -120,6 +120,59 @@ def temporal_ap(predictions, truth, threshold):
     }
 
 
+def localization_check(predictions):
+    """E7: với fake partial, điểm theo ô có tăng đúng trong đoạn bị vẽ không (theo generator).
+
+    Chỉ so ô trong và ngoài đoạn của cùng clip, nên đặc tính chung cả clip không giúp được.
+    peak_inside_rate: tỷ lệ clip có ô điểm cao nhất nằm trong đoạn bị vẽ.
+    """
+    result = {}
+    groups = {}
+    for p in predictions:
+        row = p["row"]
+        if row["label"] != 1 or row.get("variant") != "partial":
+            continue
+        groups.setdefault(row.get("generator", "unknown"), []).append(p)
+    for generator, items in sorted(groups.items()):
+        labels, scores, gaps, peaks = [], [], [], []
+        for p in items:
+            observed = p["valid"] & (p["target"] >= 0)
+            inside, outside = observed & (p["target"] >= 0.5), observed & (p["target"] == 0)
+            if not inside.any() or not outside.any():
+                continue
+            values = np.asarray(p["scores"])
+            labels += [1] * int(inside.sum()) + [0] * int(outside.sum())
+            scores += values[inside].tolist() + values[outside].tolist()
+            gaps.append(float(values[inside].mean() - values[outside].mean()))
+            peaks.append(bool(inside[np.flatnonzero(observed)[np.argmax(values[observed])]]))
+        result[generator] = {
+            "clips": len(gaps),
+            "cell_auc_inside_vs_outside": float(roc_auc_score(labels, scores))
+            if len(set(labels)) == 2
+            else None,
+            "mean_inside_minus_outside": float(np.mean(gaps)) if gaps else None,
+            "peak_inside_rate": float(np.mean(peaks)) if peaks else None,
+        }
+    return result
+
+
+def diagnostic_summary(predictions, threshold, real_false_alarm=None):
+    """E6: mẫu chẩn đoán nhãn 0 (xử lý không AI) có bị báo AI không, theo từng loại."""
+    groups = {}
+    for p in predictions:
+        if p["video_score"] is not None:
+            groups.setdefault(p["row"]["diagnostic"], []).append(p["video_score"])
+    return {
+        name: {
+            "samples": len(values),
+            "false_alarm_rate": float(np.mean(np.asarray(values) >= threshold)),
+            "mean_video_score": float(np.mean(values)),
+            "real_false_alarm_rate": real_false_alarm,
+        }
+        for name, values in sorted(groups.items())
+    }
+
+
 def grouped_auc_interval(predictions, replicates=1000, seed=42):
     """Bootstrap component nguồn/người, không bootstrap từng variant hoặc frame."""
     from vn_av_df.data.groups import connected_groups

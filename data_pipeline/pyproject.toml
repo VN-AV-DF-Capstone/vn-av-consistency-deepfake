@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "vn-av-data"
 version = "2.0.0"
 description = "Download, curate and export reviewed audio-visual datasets"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.24,<3", "opencv-python>=4.8", "av>=12", "scipy>=1.11,<2",
   "imageio-ffmpeg==0.6.0", "PyYAML>=6", "onnxruntime>=1.20",
@@ -29,7 +29,7 @@ pythonpath = ["src"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]

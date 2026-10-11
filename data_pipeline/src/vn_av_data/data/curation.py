@@ -82,6 +82,38 @@ def scan_visual(path, cfg, origin, tracker=None):
     return samples, scenes
 
 
+def every_frame_faces(path, cfg, origin, start, end, tracker=None):
+    """Mọi frame trong cửa sổ có đúng một mặt hợp lệ (luật của generator: Wav2Lip/MuseTalk dò
+    mặt ở mọi frame). Bước quét 4 fps không bảo đảm điều này nên cửa sổ đã qua quét được kiểm lại.
+    """
+    import av
+    import cv2
+
+    from vn_av_data.features.face import FaceTracker
+
+    tracker = tracker or FaceTracker(cfg["face_model"], min_size=cfg["min_face_size"])
+    tracker.previous = None
+    with av.open(str(path)) as container:
+        stream = container.streams.video[0]
+        container.seek(int(max(0.0, origin + start - 1) / stream.time_base), stream=stream)
+        for frame in container.decode(stream):
+            if frame.pts is None:
+                raise ValueError("Video frame without timestamp")
+            time = float(frame.pts * frame.time_base) - origin
+            if time < start - 1e-6:
+                continue
+            if time >= end - 1e-6:
+                break
+            image = frame.to_ndarray(format="bgr24")
+            scale = min(1, cfg["scan_max_side"] / max(image.shape[:2]))
+            image = cv2.resize(
+                image, (round(image.shape[1] * scale), round(image.shape[0] * scale))
+            )
+            if not tracker.inspect(image)["valid"]:
+                return False
+    return True
+
+
 def plan_clips(speech, scenes, duration, cfg):
     minimum, maximum, overlap = cfg["min_seconds"], cfg["max_seconds"], cfg["overlap_seconds"]
     if not (0 < minimum <= maximum <= 60 and 0 <= overlap < minimum):
@@ -174,7 +206,9 @@ def cut_media(source, output, start, end, origin):
         partial.unlink(missing_ok=True)
 
 
-def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=None):
+def curate_sources(
+    manifest, output, cfg, speech_detector=None, visual_scanner=None, frame_checker=None
+):
     from vn_av_data.data.source_io import read_rows
 
     progress = Path(manifest).resolve().parent / "logs/download_results.csv"
@@ -266,7 +300,10 @@ def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=N
                 }
                 write_json(journal, finished)
                 continue
-            speech = (speech_detector or detect_speech)(path, cfg["vad_model"], origin, duration)
+            # Gộp khoảng lặng ngắn (merge_silence_seconds) để câu nói không bị tách vụn.
+            speech = (speech_detector or detect_speech)(
+                path, cfg["vad_model"], origin, duration, cfg.get("merge_silence_seconds", 0.3)
+            )
             speech_s = sum(end - start for start, end in speech)
             print(
                 f"  VAD: {speech_s:.0f}s tiếng nói ({speech_s / duration:.0%}), "
@@ -312,6 +349,11 @@ def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=N
                 if ratio < cfg["min_face_ratio"]:
                     rejected_source.append({**base, "reason": "face"})
                     continue
+                if cfg.get("every_frame_face") and not (frame_checker or every_frame_faces)(
+                    path, cfg, origin, start, end
+                ):
+                    rejected_source.append({**base, "reason": "face_frame"})
+                    continue
                 target = output / "clips" / (clip_id + ".mp4")
                 # Nguồn chưa ghi vào sources.json = lần trước bị ngắt giữa chừng: cắt lại clip dở.
                 target.unlink(missing_ok=True)
@@ -341,7 +383,8 @@ def curate_sources(manifest, output, cfg, speech_detector=None, visual_scanner=N
             write_json(journal, finished)
             print(
                 f"  {len(accepted_source) + len(rejected_source)} cửa sổ: giữ "
-                f"{len(accepted_source)} clip ({clip_s:.0f}s), loại do mặt {reasons['face']}, "
+                f"{len(accepted_source)} clip ({clip_s:.0f}s), loại do mặt {reasons['face']} "
+                f"(+{reasons['face_frame']} khi kiểm mọi frame), "
                 f"do thiếu mẫu {reasons['coverage']} | {elapsed:.0f}s",
                 flush=True,
             )

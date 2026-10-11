@@ -10,10 +10,7 @@ from vn_av_df.common.runtime import read_json, run, sha, write_json
 MEDIA = {
     "face": "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
 }
-FATE_REVISION = "beae95aeb6f72cf1751d06d1428931016a7a1867"
 HF_REVISIONS = {
-    "facebook/pe-av-small": "dd050762bb9704ae9cd996ca45532a98f81d817e",
-    "Guan123/fate": "8463ab93a644a22bd85db91e7e77d99ebe1ec5e0",
     "facebook/dinov2-small": "ed25f3a31f01632728cabb09d1542f84ab7b0056",
 }
 
@@ -69,7 +66,7 @@ def pinned_snapshot(repo_id, target, patterns):
 
 
 def setup_avhubert(encoder):
-    """Chuẩn bị AV-HuBERT Base và landmark; không cài fairseq vào env FATE."""
+    """Chuẩn bị AV-HuBERT Base và landmark; fairseq chỉ cài trong worker riêng."""
     import bz2
 
     pinned_repository(
@@ -114,8 +111,8 @@ def fetch_file(url, destination):
         partial.unlink(missing_ok=True)
 
 
-def setup_assets(cfg, only="all"):
-    """Setup tất cả encoder được chọn; không tải các nhánh ablation không dùng."""
+def setup_assets(cfg, only=None):
+    """Setup encoder được chọn (AV-HuBERT, DINOv2); không tải encoder không dùng."""
     if cfg.get("methods"):
         from vn_av_df.features.registry import method_config
 
@@ -136,33 +133,4 @@ def setup_assets(cfg, only="all"):
             cfg["encoder"]["model"],
             ["config.json", "model.safetensors", "preprocessor_config.json"],
         )
-    result = {}
-    if only in ("all", "media"):
-        target = cfg["encoder"]["face_model"]
-        result["face"] = fetch_file(MEDIA["face"], target)
-    if only in ("all", "fate", "source"):
-        encoder = cfg["encoder"]
-        repo = Path(encoder["repo"])
-        if not repo.exists():
-            repo.parent.mkdir(parents=True, exist_ok=True)
-            run(["git", "clone", "--depth", "1", "https://github.com/guankaisi/FATE.git", repo])
-            run(["git", "fetch", "--depth", "1", "origin", FATE_REVISION], cwd=repo)
-            run(["git", "checkout", "--detach", FATE_REVISION], cwd=repo)
-        if not (repo / "models/pe_av/modeling_pe_audio_video.py").is_file():
-            raise ValueError(f"Incomplete FATE source: {repo}")
-        commit = run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
-        if commit != FATE_REVISION:
-            raise ValueError(
-                "FATE source differs from the tested revision; use a new encoder.repo path"
-            )
-        lock = repo / "vn_av_revision.json"
-        if lock.exists() and read_json(lock)["commit"] != commit:
-            raise ValueError("FATE revision changed; use a separate source/cache directory")
-        write_json(lock, {"commit": commit, "repository": "https://github.com/guankaisi/FATE"})
-        result["fate_source"] = commit
-        if only != "source":
-            for key, name in (("base", "facebook/pe-av-small"), ("adapter", "Guan123/fate")):
-                result[key] = hf_snapshot(
-                    name, encoder[key], ["*.json", "*.safetensors", "*.txt", "*.model"]
-                )
-    return result
+    raise ValueError(f"Unknown encoder kind: {cfg['encoder'].get('kind')}")

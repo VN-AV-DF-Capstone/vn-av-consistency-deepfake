@@ -87,7 +87,7 @@ def test_donor_source_design_labels_audio_and_skip(tmp_path):
         "generated_dataset": str(tmp_path / "generated"),
         "generation": {
             "clips_per_split": 0,
-            "partial_seconds": [0.4],
+            "partial_range_s": [0.4, 0.4],
             "crf": 18,
             "max_side": 640,
             "include_sham": True,
@@ -141,6 +141,64 @@ def test_donor_source_design_labels_audio_and_skip(tmp_path):
         assert same == (r["audio_mode"] == "source")
 
 
+def test_mechfake_and_diagnostic_rows_and_random_partials(tmp_path):
+    from vn_av_df.common.runtime import fingerprint
+    from vn_av_df.dataset import condition
+
+    root = tmp_path / "clean"
+    clean_bundle(root, [(f"s{i}", f"p{i // 2}") for i in range(6)])
+    mech = ["mech_blend", "mech_vae"]
+    cfg = {
+        "seed": 42,
+        "clean_dataset": str(root),
+        "plan": str(tmp_path / "plan.json"),
+        "generated_dataset": str(tmp_path / "generated"),
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.2, 3.0],
+            "crf": 18,
+            "max_side": 640,
+            "include_sham": True,
+            "generators_by_split": {
+                "train": ["wav2lip_gan", *mech],
+                "validation": ["wav2lip_gan", *mech],
+                "test": ["wav2lip_gan", "diag_paste"],
+            },
+        },
+    }
+    with pytest.raises(ValueError, match="First generator"):
+        make_plan(
+            {**cfg, "generation": {**cfg["generation"], "generators_by_split": {"train": mech}}}
+        )
+    make_plan(cfg)
+    jobs = read_json(cfg["plan"])["jobs"]
+    for parent in {j["original"]["clip_id"] for j in jobs}:
+        mine = [j for j in jobs if j["original"]["clip_id"] == parent]
+        real = fingerprint(mine[0])[:20] + "_real"
+        assert mine[0]["emit_real"] and all(j["real_sample_id"] == real for j in mine[1:])
+        flags = [j["fusion_subset"] for j in mine if j["generator"] in mech]
+        assert flags == [] or sum(flags) == 1  # Đúng một cơ chế mỗi parent được trích đủ.
+    generate(cfg, paint_generator)
+    finalize(cfg)
+    bundle = load_dataset(cfg["generated_dataset"], verify_media=True)
+    ids = {r["sample_id"]: r for r in bundle}
+    fakes = [r for r in bundle if r["generator"] in mech]
+    assert fakes and all(r["label"] == 1 and r["audio_mode"] == "source" for r in fakes)
+    assert all(ids[r["box_sample_id"]]["variant"] == "real" for r in fakes)
+    assert {r["feature_scope"] for r in fakes} == {"full", "artifact"}
+    assert all(r["split"] != "test" for r in fakes)
+    diagnostics = [r for r in bundle if r.get("diagnostic")]
+    assert diagnostics and all(
+        r["label"] == 0
+        and r["split"] == "test"
+        and r["fake_intervals"] == []
+        and condition(r) == "diag/paste"
+        for r in diagnostics
+    )
+    lengths = [b - a for r in bundle if r["variant"] == "partial" for a, b in r["fake_intervals"]]
+    assert lengths and all(0.2 - 1e-6 <= x <= 3.0 + 1e-6 for x in lengths)
+
+
 def test_generation_stops_at_deadline_and_resumes_in_parallel(tmp_path):
     import time
 
@@ -153,7 +211,12 @@ def test_generation_stops_at_deadline_and_resumes_in_parallel(tmp_path):
         "clean_dataset": str(root),
         "plan": str(tmp_path / "plan.json"),
         "generated_dataset": str(tmp_path / "generated"),
-        "generation": {"clips_per_split": 1, "partial_seconds": [0.4], "crf": 18, "max_side": 640},
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.4, 0.4],
+            "crf": 18,
+            "max_side": 640,
+        },
     }
     make_plan(cfg)
     jobs = read_json(cfg["plan"])["jobs"]
@@ -186,7 +249,12 @@ def test_generation_skips_pairs_without_face_but_stops_on_other_errors(tmp_path)
         "clean_dataset": str(root),
         "plan": str(tmp_path / "plan.json"),
         "generated_dataset": str(tmp_path / "generated"),
-        "generation": {"clips_per_split": 1, "partial_seconds": [0.4], "crf": 18, "max_side": 640},
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.4, 0.4],
+            "crf": 18,
+            "max_side": 640,
+        },
     }
     make_plan(cfg)
     jobs = read_json(cfg["plan"])["jobs"]
@@ -232,7 +300,12 @@ def test_generation_skips_generator_errors_but_stops_on_a_failing_streak(tmp_pat
         "clean_dataset": str(root),
         "plan": str(tmp_path / "plan.json"),
         "generated_dataset": str(tmp_path / "generated"),
-        "generation": {"clips_per_split": 1, "partial_seconds": [0.4], "crf": 18, "max_side": 640},
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.4, 0.4],
+            "crf": 18,
+            "max_side": 640,
+        },
     }
     make_plan(cfg)
     out = Path(cfg["generated_dataset"])
@@ -277,7 +350,12 @@ def test_real_media_generation_review_export_and_resume(tmp_path, multigenerator
         "clean_dataset": str(root),
         "plan": str(tmp_path / "plan.json"),
         "generated_dataset": str(tmp_path / "generated"),
-        "generation": {"clips_per_split": 1, "partial_seconds": [0.4], "crf": 18, "max_side": 640},
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.4, 0.4],
+            "crf": 18,
+            "max_side": 640,
+        },
     }
     if multigenerator:
         cfg["generation"].update(

@@ -1,7 +1,7 @@
-"""avh_realrecon (P1 cũ): tái dựng real-only ở 25 Hz, sau đó detector trên ô 0,2 giây.
+"""Stage A của P2: tái dựng A→V chỉ từ real ở 25 Hz, rồi đóng băng.
 
-Đây là thiết kế của project, không phải implementation AuViRe chính thức.
-Normalizer và reconstructor được đóng băng trước supervised training.
+Lấy cảm hứng residual tái dựng của AuViRe, không phải implementation chính thức.
+Ở v001 R không vượt dự đoán hằng số; v002 giữ để train lại P2 làm mốc so sánh.
 """
 
 import copy
@@ -65,92 +65,6 @@ class Reconstructor(nn.Module):
 
     def forward(self, audio):
         return self.output(self.blocks(F.gelu(self.input(audio))))
-
-
-class RealReconDetector(nn.Module):
-    """Visual/residual fusion có gate, TCN nhỏ và binary head; stride ghi trong checkpoint."""
-
-    def __init__(
-        self,
-        audio_dim,
-        visual_dim,
-        architecture="realrecon",
-        hidden=128,
-        dropout=0.1,
-        native_stride=5,
-    ):
-        super().__init__()
-        if architecture != "realrecon" or native_stride < 1 or hidden < 4:
-            raise ValueError("Invalid architecture/stride/hidden")
-        self.config = dict(
-            audio_dim=audio_dim,
-            visual_dim=visual_dim,
-            architecture=architecture,
-            hidden=hidden,
-            dropout=dropout,
-            native_stride=native_stride,
-        )
-        for name, dim in (("audio", audio_dim), ("visual", visual_dim)):
-            self.register_buffer(name + "_mean", torch.zeros(dim))
-            self.register_buffer(name + "_std", torch.ones(dim))
-        self.register_buffer("reconstruction_ready", torch.tensor(False))
-        self.reconstructor = Reconstructor(audio_dim, visual_dim, hidden)
-        self.visual_projection = nn.Sequential(
-            nn.Linear(visual_dim, hidden), nn.LayerNorm(hidden), nn.GELU()
-        )
-        self.residual_projection = nn.Sequential(
-            nn.Linear(visual_dim + 2, hidden), nn.LayerNorm(hidden), nn.GELU()
-        )
-        self.gate = nn.Sequential(nn.Linear(hidden * 2, 64), nn.GELU(), nn.Linear(64, 2))
-        # Không dùng; giữ (đóng băng) để nạp được checkpoint avh_realrecon đã train.
-        self.concat = nn.Linear(hidden * 2, hidden).requires_grad_(False)
-        self.temporal = nn.Sequential(*(TemporalBlock(hidden, d, dropout) for d in (1, 2, 4)))
-        self.classifier = nn.Linear(hidden, 1)
-        self.freeze_reconstruction()
-
-    def freeze_reconstruction(self):
-        """Supervised gradient không được thay đổi quan hệ học từ real."""
-        self.reconstructor.eval().requires_grad_(False)
-
-    def train(self, mode=True):
-        super().train(mode)
-        self.freeze_reconstruction()
-        return self
-
-    def normalize(self, audio, visual):
-        return (
-            (audio - self.audio_mean) / self.audio_std,
-            (visual - self.visual_mean) / self.visual_std,
-        )
-
-    def output_valid(self, valid):
-        """Một ô chỉ hợp lệ nếu mọi frame của ô được quan sát; không nối gap."""
-        stride = self.config["native_stride"]
-        return torch.stack([valid[i : i + stride].all() for i in range(0, len(valid), stride)])
-
-    def forward(self, audio, visual, valid):
-        if not bool(self.reconstruction_ready):
-            raise ValueError("Train real-only reconstruction before detector training")
-        if audio.ndim != 2 or visual.shape[0] != len(audio) or valid.shape != (len(audio),):
-            raise ValueError("Expected audio[T,D], visual[T,D], valid[T]")
-        if not torch.isfinite(audio[valid]).all() or not torch.isfinite(visual[valid]).all():
-            raise ValueError("Nonfinite features")
-        a, v = self.normalize(
-            audio.masked_fill(~valid[:, None], 0), visual.masked_fill(~valid[:, None], 0)
-        )
-        error = reconstruction_error(self.reconstructor, a, v, valid)
-        stride = self.config["native_stride"]
-        # Pool sau reconstruction, giữ thông tin residual frame-native.
-        v = torch.stack([v[i : i + stride].mean(0) for i in range(0, len(v), stride)])
-        error = torch.stack([error[i : i + stride].mean(0) for i in range(0, len(error), stride)])
-        mask = self.output_valid(valid)
-        vp, ep = self.visual_projection(v), self.residual_projection(error)
-        weights = self.gate(torch.cat([vp, ep], -1)).softmax(-1)
-        fused = weights[:, :1] * vp + weights[:, 1:] * ep
-        result = fused.new_zeros(len(fused))
-        for left, right in valid_runs(mask):
-            result[left:right] = self.classifier(self.temporal(fused[left:right]))[:, 0]
-        return result
 
 
 def balanced_order(rows, seed):

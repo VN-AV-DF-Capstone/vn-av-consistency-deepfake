@@ -112,7 +112,9 @@ def check_intervals(spans, duration):
 
 
 def condition(row):
-    """Ô thiết kế 2×2: real, sham, hoặc <generator>/<audio_mode> cho fake."""
+    """Ô thiết kế 2×2: real, sham, <generator>/<audio_mode> cho fake; diag/<loại> cho E6."""
+    if row.get("diagnostic"):
+        return f"diag/{row['diagnostic']}"
     if row["label"] == 0:
         return "sham" if row.get("control_type") else "real"
     return f"{row['generator']}/{row.get('audio_mode') or 'unknown'}"

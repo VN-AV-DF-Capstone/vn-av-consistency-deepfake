@@ -1,4 +1,4 @@
-"""P2 SyncArtifact: nhánh sync không thấy fake + nhánh artifact DINOv2 + fusion.
+"""P2 SyncArtifact (đề xuất v001, giữ làm mốc v002): nhánh sync không thấy fake + DINOv2 + gate.
 
 Stage A (chung P1): R học A→V chỉ từ real. Stage S: head sync học real, sham và real
 bị dịch lệch tiếng trên cache, rồi đóng băng. Stage C: nhánh artifact + fusion học nhãn
@@ -22,13 +22,7 @@ from vn_av_df.reconstruction import (
     valid_runs,
 )
 
-ARCHITECTURES = (
-    "syncartifact",
-    "syncartifact_concat",
-    "syncartifact_unfrozen",
-    "sync_only",
-    "artifact_only",
-)
+ARCHITECTURES = ("syncartifact",)
 
 
 def pool_cells(x, stride):
@@ -72,8 +66,8 @@ class SyncArtifactDetector(nn.Module):
         for name, dim in (("audio", audio_dim), ("visual", visual_dim)):
             self.register_buffer(name + "_mean", torch.zeros(dim))
             self.register_buffer(name + "_std", torch.ones(dim))
-        self.register_buffer("reconstruction_ready", torch.tensor(architecture == "artifact_only"))
-        self.register_buffer("sync_ready", torch.tensor(architecture == "artifact_only"))
+        self.register_buffer("reconstruction_ready", torch.tensor(False))
+        self.register_buffer("sync_ready", torch.tensor(False))
         self.reconstructor = Reconstructor(audio_dim, visual_dim, hidden)
         self.sync_projection = nn.Sequential(
             nn.Linear(visual_dim + 2, hidden), nn.LayerNorm(hidden), nn.GELU()
@@ -89,42 +83,22 @@ class SyncArtifactDetector(nn.Module):
         )
         self.artifact_head = nn.Linear(hidden, 1)
         self.gate = nn.Sequential(nn.Linear(hidden * 2, 64), nn.GELU(), nn.Linear(64, 2))
-        self.concat = nn.Linear(hidden * 2, hidden)
         self.fusion_input = nn.Sequential(
             nn.Linear(hidden + 2, hidden), nn.LayerNorm(hidden), nn.GELU()
         )
         self.fusion_temporal = nn.Sequential(*(TemporalBlock(hidden, d, dropout) for d in (1, 2)))
         self.classifier = nn.Linear(hidden, 1)
         self.outputs = {}
-        # Không đếm nhánh không dùng vào trainable parameter budget của ablation.
-        unused = []
-        if architecture not in {"syncartifact", "syncartifact_unfrozen"}:
-            unused.append(self.gate)
-        if architecture != "syncartifact_concat":
-            unused.append(self.concat)
-        if architecture == "sync_only":
-            unused += [self.artifact_projection, self.artifact_temporal, self.artifact_head]
-        for module in unused:
-            module.requires_grad_(False)
         self.freeze_reconstruction()
-
-    @property
-    def uses_sync(self):
-        return self.config["architecture"] != "artifact_only"
-
-    @property
-    def uses_artifact(self):
-        return self.config["architecture"] != "sync_only"
 
     def sync_modules(self):
         return self.sync_projection, self.sync_temporal, self.sync_head
 
     def freeze_reconstruction(self):
-        """R luôn đóng băng; nhánh sync đóng băng ngoài stage S, trừ ablation unfrozen."""
+        """R và nhánh sync luôn đóng băng ngoài stage A/S."""
         self.reconstructor.eval().requires_grad_(False)
-        if self.config["architecture"] != "syncartifact_unfrozen":
-            for module in self.sync_modules():
-                module.eval().requires_grad_(False)
+        for module in self.sync_modules():
+            module.eval().requires_grad_(False)
 
     def train(self, mode=True):
         super().train(mode)
@@ -148,19 +122,18 @@ class SyncArtifactDetector(nn.Module):
             raise ValueError("Expected audio[T,D], visual[T,D], valid[T]")
         stride = self.config["native_stride"]
         mask = self.output_valid(valid)
-        sync_hidden = sync_logit = artifact_hidden = artifact_logit = None
-        if self.uses_sync:
-            if not bool(self.reconstruction_ready):
-                raise ValueError("Train real-only reconstruction before detector training")
-            if not torch.isfinite(audio[valid]).all() or not torch.isfinite(visual[valid]).all():
-                raise ValueError("Nonfinite features")
-            a, v = self.normalize(
-                audio.masked_fill(~valid[:, None], 0), visual.masked_fill(~valid[:, None], 0)
-            )
-            error = pool_cells(reconstruction_error(self.reconstructor, a, v, valid), stride)
-            sync_hidden = run_temporal(self.sync_temporal, self.sync_projection(error), mask)
-            sync_logit = self.sync_head(sync_hidden)[:, 0].masked_fill(~mask, 0)
-        if self.uses_artifact and need_artifact:
+        if not bool(self.reconstruction_ready):
+            raise ValueError("Train real-only reconstruction before detector training")
+        if not torch.isfinite(audio[valid]).all() or not torch.isfinite(visual[valid]).all():
+            raise ValueError("Nonfinite features")
+        a, v = self.normalize(
+            audio.masked_fill(~valid[:, None], 0), visual.masked_fill(~valid[:, None], 0)
+        )
+        error = pool_cells(reconstruction_error(self.reconstructor, a, v, valid), stride)
+        sync_hidden = run_temporal(self.sync_temporal, self.sync_projection(error), mask)
+        sync_logit = self.sync_head(sync_hidden)[:, 0].masked_fill(~mask, 0)
+        artifact_hidden = artifact_logit = None
+        if need_artifact:
             if artifact is None or artifact.shape != (len(audio), self.config["artifact_dim"]):
                 raise ValueError("P2 needs native artifact features [T, artifact_dim]")
             if not torch.isfinite(artifact[valid]).all():
@@ -176,30 +149,15 @@ class SyncArtifactDetector(nn.Module):
             artifact_logit = self.artifact_head(artifact_hidden)[:, 0].masked_fill(~mask, 0)
         return sync_hidden, sync_logit, artifact_hidden, artifact_logit, mask
 
-    def forward(self, audio, visual, valid, artifact=None):
-        if self.uses_sync and not bool(self.sync_ready):
+    def forward(self, audio, visual, valid, artifact=None, lip=None):
+        if not bool(self.sync_ready):
             raise ValueError("Train the sync stage before detector training")
         sync_hidden, sync_logit, artifact_hidden, artifact_logit, mask = self.branches(
             audio, visual, valid, artifact
         )
-        kind = self.config["architecture"]
-        if kind == "sync_only":
-            fused = sync_hidden
-        elif kind == "artifact_only":
-            fused = artifact_hidden
-        elif kind == "syncartifact_concat":
-            fused = self.concat(torch.cat([sync_hidden, artifact_hidden], -1))
-        else:
-            weights = self.gate(torch.cat([sync_hidden, artifact_hidden], -1)).softmax(-1)
-            fused = weights[:, :1] * sync_hidden + weights[:, 1:] * artifact_hidden
-        zeros = fused.new_zeros(len(fused))
-        evidence = torch.stack(
-            [
-                zeros if sync_logit is None else sync_logit,
-                zeros if artifact_logit is None else artifact_logit,
-            ],
-            -1,
-        )
+        weights = self.gate(torch.cat([sync_hidden, artifact_hidden], -1)).softmax(-1)
+        fused = weights[:, :1] * sync_hidden + weights[:, 1:] * artifact_hidden
+        evidence = torch.stack([sync_logit, artifact_logit], -1)
         hidden = run_temporal(
             self.fusion_temporal, self.fusion_input(torch.cat([fused, evidence], -1)), mask
         )

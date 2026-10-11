@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT.parent))
 # PART/SPLIT_* dùng ở 05_export (gán split khi export).
 from data_settings import (  # noqa: E402, F401
     DATASET_NAME,
+    MAX_CLIPS_PER_SPEAKER,
+    MIN_TEST_GROUPS,
     PART,
     SPLIT_HISTORY,
     SPLIT_RATIOS,

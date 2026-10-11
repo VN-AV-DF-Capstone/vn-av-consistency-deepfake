@@ -65,7 +65,7 @@ def speech_regions(probabilities, duration, threshold=0.5, silence_s=0.3, pad_s=
     return padded
 
 
-def detect_speech(path, model, origin_s, duration):
+def detect_speech(path, model, origin_s, duration, silence_s=0.3):
     import onnxruntime as ort
 
     require_file(model, "Silero VAD; run relations-setup --only media")
@@ -80,4 +80,4 @@ def detect_speech(path, model, origin_s, duration):
         )
         probabilities.append(float(output.ravel()[0]))
         context = samples[-64:]
-    return speech_regions(probabilities, duration)
+    return speech_regions(probabilities, duration, silence_s=silence_s)

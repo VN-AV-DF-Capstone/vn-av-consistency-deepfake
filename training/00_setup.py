@@ -2,8 +2,7 @@
 
 Run File: tải encoder của ARCHITECTURES trong settings.py.
 Chỉ AV-HuBERT: python training/00_setup.py --encoder avhubert
-Chỉ FATE:      python training/00_setup.py --encoder fate
-Chỉ DINOv2:    python training/00_setup.py --encoder dinov2  (nhánh artifact P2, cần thêm avhubert)
+Chỉ DINOv2:    python training/00_setup.py --encoder dinov2  (nhánh dấu vết vẽ, cần thêm avhubert)
 Cần Internet và Git. Không cần dataset hoặc GPU ở bước tải này.
 """
 
@@ -24,7 +23,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--encoder",
-        choices=["selected", "avhubert", "fate", "dinov2"],
+        choices=["selected", "avhubert", "dinov2"],
         default="selected",
         help="selected: encoders needed by ARCHITECTURES in settings.py",
     )

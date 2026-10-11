@@ -182,8 +182,8 @@ def test_notebook_bootstrap_configures_only_its_worker(notebook, worker, tmp_pat
         "musetalk": {"python": "unchanged"},
         "encoders": {"avhubert": {"python": "unchanged"}},
         "architectures": ["selected"],
-        "methods": {"selected": {"encoder": "avhubert" if needed else "fate"}},
-        "prepare_encoders": ["avhubert", "dinov2"] if needed else ["fate", "dinov2"],
+        "methods": {"selected": {"encoder": "avhubert"}},
+        "prepare_encoders": ["avhubert", "dinov2"] if needed else ["dinov2"],
         # Generator của phiên generate: chỉ cài worker MuseTalk khi phiên này sinh MuseTalk.
         "generation_generators": ["musetalk_1_5"] if needed else ["wav2lip_gan"],
         "generation": {
@@ -255,17 +255,31 @@ def part_folder(root, name="vn-av-df-data-part7", nested=True):
     return folder.parent if nested else folder
 
 
-MAIN = ["fate_gru", "avh_tcn", "p2_syncartifact"]
-VARIANTS = ["p2_sync_only", "p2_artifact_only", "p2_concat", "p2_sync_seen_fake", "avh_realrecon"]
+MAIN = [
+    "avh_tcn",
+    "p2_syncartifact",
+    "tricue_mech",
+    "tricue_w2l",
+    "tricue_mech_w2l",
+    "tricue_mech_no_lead",
+    "tricue_mech_no_sync",
+    "tricue_mech_no_art",
+]
+ANALYSIS = [
+    "art_all",
+    *[f"art_only_m{i}" for i in range(1, 6)],
+    "art_m1_m5",
+    *[f"art_drop_m{i}" for i in range(1, 6)],
+]
 
 
 @pytest.mark.parametrize(
     "selection,expected",
     [
-        ("all", MAIN + VARIANTS),
+        ("all", MAIN + ANALYSIS),
         (MAIN, MAIN),
-        (["fate_gru"], ["fate_gru"]),
-        (["avh_realrecon", "p2_sync_only"], ["avh_realrecon", "p2_sync_only"]),
+        (["tricue_mech"], ["tricue_mech"]),
+        (["art_all", "art_drop_m3"], ["art_all", "art_drop_m3"]),
     ],
 )
 def test_training_notebook_uses_edited_models_parts_and_hyperparameters(
@@ -302,9 +316,9 @@ def test_training_notebook_uses_edited_models_parts_and_hyperparameters(
 @pytest.mark.parametrize(
     "selection,encoders,architectures",
     [
-        ("all", ["fate", "avhubert", "dinov2"], MAIN),
-        (["dinov2", "avhubert"], ["avhubert", "dinov2"], ["avh_tcn", "p2_syncartifact"]),
-        (["fate"], ["fate"], ["fate_gru"]),
+        ("all", ["avhubert", "dinov2"], ["avh_tcn", "tricue_mech"]),
+        (["dinov2", "avhubert"], ["avhubert", "dinov2"], ["avh_tcn", "tricue_mech"]),
+        (["avhubert"], ["avhubert"], ["avh_tcn"]),
     ],
 )
 def test_prepare_notebook_selects_encoders_and_feature_settings(
@@ -344,7 +358,21 @@ def test_prepare_notebook_rejects_dinov2_without_avhubert_boxes(tmp_path, monkey
 
 @pytest.mark.parametrize(
     "generators,session",
-    [("all", ["musetalk_1_5", "wav2lip_gan"]), (["wav2lip_gan"], ["wav2lip_gan"])],
+    [
+        (
+            "all",
+            sorted(
+                [
+                    "wav2lip_gan",
+                    "musetalk_1_5",
+                    "diag_paste",
+                    "diag_global",
+                    *["mech_blend", "mech_lowres", "mech_vae", "mech_warp", "mech_temporal"],
+                ]
+            ),
+        ),
+        (["wav2lip_gan"], ["wav2lip_gan"]),
+    ],
 )
 def test_generation_notebook_uses_edited_part_and_generator_settings(
     tmp_path, monkeypatch, generators, session
@@ -361,7 +389,7 @@ def test_generation_notebook_uses_edited_part_and_generator_settings(
         GENERATORS=generators,
         CRF=20,
         MUSETALK_BATCH_SIZE=2,
-        PARTIAL_SECONDS=[0.8],
+        PARTIAL_RANGE_S=[0.8, 0.8],
     )
     state["settings"].ROOT = tmp_path
     exec(sources["generate-config"], state)
@@ -369,7 +397,7 @@ def test_generation_notebook_uses_edited_part_and_generator_settings(
     assert cfg["data_part"] == 2 and cfg["clean_dataset"] == str(clean)
     assert Path(cfg["generated_dataset"]).name == "vn-av-df-data-part2"
     assert cfg["generation"]["clips_per_split"] == 0 and cfg["generation"]["crf"] == 20
-    assert cfg["generation"]["partial_seconds"] == [0.8]
+    assert cfg["generation"]["partial_range_s"] == [0.8, 0.8]
     assert cfg["generation"]["fake_audio_modes_by_split"]["train"] == ["donor"]
     assert "audio_mode" not in cfg["generation"]
     assert cfg["musetalk"]["batch_size"] == 2

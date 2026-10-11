@@ -135,7 +135,7 @@ def test_cut_resume_appends_new_sources_and_keeps_review(delayed_source, tmp_pat
         calls.append(1)
         return ([{"time_s": t, "valid": True} for t in np.arange(0, 5, 0.25)], [])
 
-    result = curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan)
+    result = curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan, lambda *_: True)
     assert result["candidates"] == 1
     # Nhật ký từng nguồn có thông số nguồn và thời gian cắt cho thống kê (notebook/W&B).
     (done,) = read_json(output / "logs/sources.json").values()
@@ -149,7 +149,7 @@ def test_cut_resume_appends_new_sources_and_keeps_review(delayed_source, tmp_pat
     rows[0]["decision"] = "keep"
     write_csv(review, rows)
     digest = sha(review)
-    curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan)
+    curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan, lambda *_: True)
     assert sha(review) == digest
     assert len(calls) == 1
     assert {p.name for p in output.iterdir()} == {"clips", "logs", "review.csv"}
@@ -157,13 +157,18 @@ def test_cut_resume_appends_new_sources_and_keeps_review(delayed_source, tmp_pat
     # Bị ngắt trước khi ghi sources.json: lần sau cắt lại nguồn đó, ghi đè clip dở.
     journal = output / "logs/sources.json"
     journal.write_text("{}", encoding="utf-8")
-    curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan)
+    curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan, lambda *_: True)
     assert len(calls) == 2
     assert sha(review) == digest
     # Tải thêm nguồn rồi cắt lại cùng thư mục: chỉ nguồn mới được quét, quyết định cũ giữ nguyên.
     sources = read_manifest(manifest)
     write_manifest(manifest, [*sources, {**sources[0], "source_id": "extra"}])
-    assert curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan)["candidates"] == 2
+    assert (
+        curate_sources(manifest, output, cfg, lambda *_: [[0, 5]], scan, lambda *_: True)[
+            "candidates"
+        ]
+        == 2
+    )
     assert len(calls) == 3
     rows = read_csv(review)
     assert [r["decision"] for r in rows] == ["keep", "uncertain"]
@@ -172,6 +177,11 @@ def test_cut_resume_appends_new_sources_and_keeps_review(delayed_source, tmp_pat
     cfg["curation"]["min_face_ratio"] = 0.8
     with pytest.raises(ValueError, match="changed"):
         curate_sources(manifest, output, cfg)
+    # Kiểm mặt mọi frame (v002): cửa sổ qua bước quét 4 fps nhưng trượt kiểm mọi frame thì bị loại.
+    strict = tmp_path / "cut-strict"
+    result = curate_sources(manifest, strict, cfg, lambda *_: [[0, 5]], scan, lambda *_: False)
+    assert result["candidates"] == 0
+    assert {r["reason"] for r in read_json(strict / "logs/rejected.json")} == {"face_frame"}
 
 
 def test_review_saves_decision_and_rejects_traversal(delayed_source, tmp_path):

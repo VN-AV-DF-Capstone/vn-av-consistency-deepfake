@@ -10,7 +10,7 @@ from vn_av_df.common.runtime import read_json, require_file, run, sha
 
 
 def setup(cfg):
-    """Tải tài sản upstream; không trộn dependency MuseTalk với FATE."""
+    """Tải tài sản upstream; dependency MuseTalk nằm ở env worker riêng."""
     from vn_av_df.assets import fetch_file, pinned_repository, pinned_snapshot
 
     repo = Path(cfg["musetalk"]["repo"])

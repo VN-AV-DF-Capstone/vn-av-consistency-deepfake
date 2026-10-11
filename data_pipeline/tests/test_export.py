@@ -84,6 +84,36 @@ def test_export_relocation_labels_and_rerun(reviewed, tmp_path):
         validate_bundle(relocated)
 
 
+def test_export_caps_clips_per_speaker_and_warns_on_small_test(reviewed, tmp_path):
+    root, review, rows = reviewed
+    # 4 clip: clip0-2 cùng một speaker, clip3 speaker khác; thêm 2 clip nguồn riêng cho đủ nhóm.
+    for row in rows[:3]:
+        row["speaker_id"] = "alice"
+    rows[3]["speaker_id"] = "bob"
+    for i in (4, 5):
+        path = root / f"clip{i}.mp4"
+        path.write_bytes(f"fixture-video-{i}".encode())
+        rows.append(
+            {
+                **rows[3],
+                "clip_id": f"clip{i}",
+                "file_path": path.name,
+                "sha256": sha(path),
+                "source_id": f"source{i}",
+                "speaker_id": f"carol{i}",
+            }
+        )
+    write_csv(review, rows)
+    report = export_dataset(review, root, tmp_path / "capped", "test", max_clips_per_speaker=2)
+    assert report["clips"] == 5 and len(report["clips_capped_per_speaker"]) == 1
+    assert report["clips_capped_per_speaker"][0] in {"clip0", "clip1", "clip2"}
+    # 60/15/25 mặc định; test ít hơn 5 nhóm độc lập chỉ cảnh báo, vẫn export.
+    assert report["split_groups_by_split"]["test"] < 5 and "Test chỉ có" in report["warnings"][0]
+    info = json.loads((tmp_path / "capped/dataset_info.json").read_text(encoding="utf-8"))
+    assert info["max_clips_per_speaker"] == 2
+    assert info["split"]["split_ratios"] == {"train": 0.6, "validation": 0.15, "test": 0.25}
+
+
 def test_export_requires_sync_confirmation_and_detects_changed_review(reviewed, tmp_path):
     root, review, rows = reviewed
     rows[0]["sync_status"] = "unverified"

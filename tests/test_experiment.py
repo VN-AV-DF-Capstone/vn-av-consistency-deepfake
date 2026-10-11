@@ -11,10 +11,9 @@ from vn_av_df.experiment import evaluate, load_model, train_one, train_selected
 from vn_av_df.models import TemporalDetector
 
 
-@pytest.mark.parametrize("architecture", ["gru", "tcn"])
-def test_masks_block_temporal_leakage_and_gradients(architecture):
+def test_masks_block_temporal_leakage_and_gradients():
     torch.manual_seed(2)
-    model = TemporalDetector(8, 8, architecture, hidden=8, dropout=0).eval()
+    model = TemporalDetector(8, 8, "tcn", hidden=8, dropout=0).eval()
     a = torch.randn(12, 8)
     v = torch.randn(12, 8)
     valid = torch.ones(12, dtype=torch.bool)
@@ -91,8 +90,8 @@ def project(tmp_path):
         "runs": str(tmp_path / "runs"),
         "device": "cpu",
         "encoder": {},
-        "architectures": ["gru", "tcn"],
-        "seeds": [42],
+        "architectures": ["tcn"],
+        "seeds": [42, 43],
         "held_out_generators": [],
         "training": {
             "epochs": 1,
@@ -115,15 +114,15 @@ def test_train_test_thresholds_lock_and_binary_output(project, tmp_path):
     assert len(results) == 2
     assert all("by_generator" in r for r in results)
     assert before == {p: load_model(p)[1]["thresholds"] for p in before}
-    assert read_json(Path(cfg["runs"]) / "evaluation.json")["runs"][0]["architecture"] == "gru"
+    assert read_json(Path(cfg["runs"]) / "evaluation.json")["runs"][0]["architecture"] == "tcn"
     index_path = Path(cfg["runs"]) / "training.json"
     write_json(index_path, {**report, "note": "changed after test"})
     with pytest.raises(ValueError, match="Test protocol changed"):
         evaluate(cfg)
     write_json(index_path, report)
     cfg["training"]["epochs"] = 2
-    train_one(cfg, "gru", 42, resume=True)
-    assert len(read_json(Path(cfg["runs"]) / "gru_seed42/history.json")) == 2
+    train_one(cfg, "tcn", 42, resume=True)
+    assert len(read_json(Path(cfg["runs"]) / "tcn_seed42/history.json")) == 2
     from vn_av_df.inference import Analyzer
 
     class FixtureEncoder:
@@ -134,13 +133,13 @@ def test_train_test_thresholds_lock_and_binary_output(project, tmp_path):
             Path(output).write_bytes(source.read_bytes())
             return {"step_s": 0.2, "duration_s": 4.0}
 
-    cfg["demo_method"] = "gru"
+    cfg["demo_method"] = "tcn"
     result = Analyzer(cfg, FixtureEncoder()).analyze("fixture.mp4")
     assert set(result) == {"video_score", "intervals"}
     assert 0 <= result["video_score"] <= 1
     cfg["training"]["hidden"] = 12
     with pytest.raises(ValueError, match="Resume"):
-        train_one(cfg, "gru", 42, resume=True)
+        train_one(cfg, "tcn", 42, resume=True)
 
 
 def test_fast_threshold_matches_exhaustive_search():
@@ -168,13 +167,13 @@ def test_fast_threshold_matches_exhaustive_search():
 def test_resume_after_early_stop_keeps_selected_checkpoint(project):
     cfg, _ = project
     cfg["training"].update(epochs=2, patience=3)
-    best = train_one(cfg, "gru", 42)
+    best = train_one(cfg, "tcn", 42)
     state = torch.load(best.parent / "last.pt", weights_only=True)
     state["stale"] = 3  # Như thể phiên trước đã early stop.
     torch.save(state, best.parent / "last.pt")
     before = sha(best)
     cfg["training"]["epochs"] = 5
-    train_one(cfg, "gru", 42, resume=True)
+    train_one(cfg, "tcn", 42, resume=True)
     assert len(read_json(best.parent / "history.json")) == 2
     assert sha(best) == before
 
@@ -184,16 +183,17 @@ def test_training_never_reads_test_cache(project):
     for r in rows:
         if r["split"] == "test":
             (Path(cfg["cache"]) / (r["sample_id"] + ".npz")).unlink()
-    train_one(cfg, "gru", 42)
+    train_one(cfg, "tcn", 42)
 
 
-@pytest.mark.parametrize("methods", [["gru"], ["gru", "tcn"]])
+@pytest.mark.parametrize("methods", [["tcn"]])
 def test_selected_training_reports_without_automatic_comparison(project, methods, monkeypatch):
     from vn_av_df.actions import execute
     from vn_av_df.inference import chosen_checkpoint
 
     cfg, rows = project
     cfg["architectures"] = methods
+    cfg["seeds"] = [42]
     execute("train", cfg)
     folder = Path(cfg["runs"])
     index = read_json(folder / "training.json")
@@ -227,9 +227,9 @@ def test_training_selection_cannot_silently_overwrite_run_index(project):
     from vn_av_df.experiment import train_selected
 
     cfg, _ = project
-    cfg["architectures"] = ["gru"]
+    cfg["architectures"], cfg["seeds"] = ["tcn"], [42]
     train_selected(cfg)
-    cfg["architectures"] = ["gru", "tcn"]
+    cfg["seeds"] = [42, 43]
     with pytest.raises(ValueError, match="selection changed"):
         train_selected(cfg, resume=True)
 
@@ -254,7 +254,7 @@ def test_train_part1_then_union_requires_new_run_and_records_parts(project):
         )
 
     part("vn-av-df-data-part1", rows)
-    cfg.update(dataset_parts=["vn-av-df-data-part1"], architectures=["gru"])
+    cfg.update(dataset_parts=["vn-av-df-data-part1"], architectures=["tcn"])
     train_selected(cfg)
     assert "vn-av-df-data-part1" in evaluate(cfg)[0]["by_part"]
     extra = []
@@ -282,7 +282,7 @@ def test_train_part1_then_union_requires_new_run_and_records_parts(project):
     cfg["dataset_parts"] = "all"
     assert len(training_dataset(cfg)[0]) == 12
     with pytest.raises(ValueError, match="Resume"):
-        train_one(cfg, "gru", 42, resume=True)
+        train_one(cfg, "tcn", 42, resume=True)
     with pytest.raises(ValueError, match="Test protocol changed"):
         evaluate(cfg)
     cfg["runs"] += "-parts1-2"
@@ -303,83 +303,18 @@ def test_old_checkpoint_rejected(tmp_path):
 def test_artifact_checkpoint_relocated_from_kaggle(tmp_path):
     from vn_av_df.experiment import resolve_checkpoint
 
-    p = tmp_path / "gru_seed42/best.pt"
+    p = tmp_path / "tcn_seed42/best.pt"
     p.parent.mkdir()
     p.write_bytes(b"path-only")
     assert (
         resolve_checkpoint(
-            {"runs": str(tmp_path)}, "/kaggle/working/project/runs/run/gru_seed42/best.pt"
+            {"runs": str(tmp_path)}, "/kaggle/working/project/runs/run/tcn_seed42/best.pt"
         )
         == p
     )
 
 
-def test_realrecon_native_training_freeze_resume_and_inference(project, monkeypatch):
-    """Native25Hz→5Hz; stage A không đọc fake/test và luôn frozen ở stage B."""
-    cfg, rows = project
-    for r in rows:
-        path = Path(cfg["cache"]) / (r["sample_id"] + ".npz")
-        with np.load(path) as z:
-            a = np.repeat(z["audio"], 5, axis=0)
-            v = np.repeat(z["visual"], 5, axis=0)
-        save_npz(
-            path,
-            audio=a,
-            visual=v,
-            times_s=np.arange(100) * 0.04,
-            audio_valid=np.ones(100, bool),
-            visual_valid=np.ones(100, bool),
-        )
-        meta = read_json(path.with_suffix(".json"))
-        meta.update(step_s=0.04, output_stride=5, feature_sha256=sha(path))
-        write_json(path.with_suffix(".json"), meta)
-    cfg["architectures"] = ["realrecon"]
-    cfg["reconstruction"] = {"epochs": 2, "lr": 0.001, "patience": 0}
-    p = train_one(cfg, "realrecon", 42)
-    model, state = load_model(p)
-    assert state["reconstruction_report"]["train_ids"] == ["train_0"]
-    assert state["reconstruction_report"]["validation_ids"] == ["validation_0"]
-    before = {k: v.clone() for k, v in model.reconstructor.state_dict().items()}
-    model.train()
-    assert not model.reconstructor.training
-    a, v = torch.randn(100, 8), torch.randn(100, 8)
-    valid = torch.ones(100, dtype=torch.bool)
-    valid[49] = False
-    scores = model(a, v, valid)
-    assert scores.shape == (20,)
-    assert not model.output_valid(valid)[9]
-    scores.sum().backward()
-    assert all(p.grad is None for p in model.reconstructor.parameters())
-    assert all(torch.equal(before[k], x) for k, x in model.reconstructor.state_dict().items())
-    cfg["training"]["epochs"] = 2
-    train_one(cfg, "realrecon", 42, resume=True)
-    cfg["reconstruction"]["epochs"] = 3
-    with pytest.raises(ValueError, match="Resume"):
-        train_one(cfg, "realrecon", 42, resume=True)
-    monkeypatch.setenv("MPLBACKEND", "Agg")
-    from vn_av_df.reporting import detector_report
-
-    report = detector_report(p.parent)
-    assert report["summary"]["reconstruction"]["best_validation_loss"] >= 0
-    assert any(Path(image).name == "reconstruction.png" for image in report["images"])
-
-
-def test_reconstruction_no_information_crosses_gap():
-    from vn_av_df.models import build_model
-
-    model = build_model(8, 8, "realrecon", 8, 0, native_stride=5).eval()
-    model.reconstruction_ready.fill_(True)
-    a, v = torch.randn(100, 8), torch.randn(100, 8)
-    mask = torch.ones(100, dtype=torch.bool)
-    mask[50:55] = False
-    first = model(a, v, mask)
-    a[55:] += 100
-    v[55:] -= 100
-    second = model(a, v, mask)
-    assert torch.allclose(first[:10], second[:10])
-
-
-def test_native_features_pooled_for_tcn_but_not_reconstruction(tmp_path):
+def test_native_features_pooled_for_tcn_but_not_native_models(tmp_path):
     from vn_av_df.features.registry import feature_arrays
 
     path = tmp_path / "cache.npz"
@@ -395,7 +330,7 @@ def test_native_features_pooled_for_tcn_but_not_reconstruction(tmp_path):
     assert arrays[0].shape == (3, 4)
     assert not arrays[2][-1]
     assert meta["step_s"] == 0.2
-    arrays, times, meta = feature_arrays(path, {"step_s": 0.04, "output_stride": 5}, "realrecon")
+    arrays, times, meta = feature_arrays(path, {"step_s": 0.04, "output_stride": 5}, "syncartifact")
     assert arrays[0].shape == (13, 4) and len(times) == 3
 
 
@@ -509,7 +444,7 @@ def test_avhubert_reuses_one_worker_and_landmarks_of_identical_frames(tmp_path, 
 
 @pytest.mark.parametrize(
     "only,expected",
-    [(None, ["fate", "avhubert", "dinov2"]), (["dinov2"], ["dinov2"]), (["fate"], ["fate"])],
+    [(None, ["avhubert", "dinov2"]), (["dinov2"], ["dinov2"]), (["avhubert"], ["avhubert"])],
 )
 def test_prepare_and_setup_only_touch_selected_encoders(tmp_path, monkeypatch, only, expected):
     from vn_av_df import assets, experiment
@@ -518,12 +453,12 @@ def test_prepare_and_setup_only_touch_selected_encoders(tmp_path, monkeypatch, o
     cfg = {
         "cache": str(tmp_path / "cache"),
         "encoder": {},
-        "encoders": {k: {"kind": k} for k in ("fate", "avhubert", "dinov2")},
+        "encoders": {k: {"kind": k} for k in ("avhubert", "dinov2")},
         "methods": {
-            "gru": {"encoder": "fate", "architecture": "gru"},
+            "tcn": {"encoder": "avhubert", "architecture": "tcn"},
             "p2": {**p2, "architecture": "syncartifact"},
         },
-        "architectures": ["gru", "p2"],
+        "architectures": ["tcn", "p2"],
         "prepare_encoders": only,
     }
     for module, name in ((experiment, "prepare"), (assets, "setup_assets")):
@@ -549,19 +484,19 @@ def test_attach_caches_links_read_only_and_copies_writable(tmp_path):
     except OSError:
         pytest.skip("Hệ thống không cho tạo symlink")
     first, second = tmp_path / "in1", tmp_path / "in2"
-    for folder, key in ((first, "fate"), (second, "avhubert"), (second, "dinov2")):
+    for folder, key in ((first, "avhubert"), (second, "dinov2")):
         (folder / key).mkdir(parents=True)
         (folder / key / "a.json").write_text("{}")
     (second / "environment").mkdir()
     target = tmp_path / "cache"
     found = attach_caches([first, second], target, writable=["dinov2"])
-    assert sorted(found) == ["avhubert", "dinov2", "fate"]
-    assert (target / "fate").is_symlink() and (target / "fate/a.json").is_file()
+    assert sorted(found) == ["avhubert", "dinov2"]
+    assert (target / "avhubert").is_symlink() and (target / "avhubert/a.json").is_file()
     assert not (target / "dinov2").is_symlink() and (target / "dinov2/a.json").is_file()
     assert not (target / "environment").exists()
     # Chạy lại cell: giữ nguyên bản đã gom.
     (target / "dinov2/b.npz").write_bytes(b"x")
     attach_caches([first, second], target, writable=["dinov2"])
     assert (target / "dinov2/b.npz").is_file()
-    with pytest.raises(ValueError, match="fate"):
+    with pytest.raises(ValueError, match="avhubert"):
         attach_caches([first, first], tmp_path / "other")

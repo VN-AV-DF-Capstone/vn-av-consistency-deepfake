@@ -117,10 +117,8 @@ def project(tmp_path):
         "encoders": {"avhubert": {"kind": "avhubert"}, "dinov2": {"kind": "dinov2"}},
         "methods": {
             "p2": {**p2, "architecture": "syncartifact"},
-            "p2_sync": {**p2, "architecture": "sync_only"},
-            "p2_artifact": {**p2, "architecture": "artifact_only"},
         },
-        "architectures": ["p2", "p2_sync", "p2_artifact"],
+        "architectures": ["p2"],
         "seeds": [42],
         "held_out_generators": [],
         "training": {
@@ -150,8 +148,6 @@ def test_p2_stages_protocol_evaluation_and_report(project, monkeypatch):
     assert sync["sham_train"] == 2
     recon = read_json(runs / "p2_seed42/reconstruction.json")
     assert all(s.endswith("_real") for s in recon["train_ids"] + recon["validation_ids"])
-    assert not (runs / "p2_artifact_seed42/sync.json").exists()
-    assert not (runs / "p2_artifact_seed42/reconstruction.json").exists()
     model, state = load_model(runs / "p2_seed42/best.pt")
     assert state["feature_signature"] == combined_signature("avh-test", "dino-test")
     assert bool(model.sync_ready) and state["sync_report"]["best_validation_loss"] >= 0
@@ -166,8 +162,6 @@ def test_p2_stages_protocol_evaluation_and_report(project, monkeypatch):
     cells = {"real", "sham", "wav2lip_gan/donor", "wav2lip_gan/source"}
     assert set(results["p2"]["by_condition"]) == cells
     assert set(results["p2"]["branches"]["scores"]) == {"sync", "artifact"}
-    assert set(results["p2_sync"]["branches"]["scores"]) == {"sync"}
-    assert set(results["p2_artifact"]["branches"]["scores"]) == {"artifact"}
     assert set(results["p2"]["branches"]["scores"]["sync"]) == cells - {"real"}
     predictions = read_json(runs / "p2_seed42/predictions-test.json")
     assert all(len(p["branch_scores"]["sync"]) == len(p["scores"]) for p in predictions)
@@ -247,9 +241,8 @@ def test_p2_inference_reports_branch_evidence(project):
         Analyzer(scoped, primary, Fixture("other", "dinov2", {"step_s": 0.04}))
 
 
-@pytest.mark.parametrize("architecture", ["syncartifact", "syncartifact_concat", "artifact_only"])
-def test_p2_no_information_crosses_gap(architecture):
-    model = build_model(8, 8, architecture, 8, 0, native_stride=5, artifact_dim=6).eval()
+def test_p2_no_information_crosses_gap():
+    model = build_model(8, 8, "syncartifact", 8, 0, native_stride=5, artifact_dim=6).eval()
     model.reconstruction_ready.fill_(True)
     model.sync_ready.fill_(True)
     a, v, art = torch.randn(100, 8), torch.randn(100, 8), torch.randn(100, 6)

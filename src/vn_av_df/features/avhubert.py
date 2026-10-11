@@ -1,4 +1,4 @@
-"""Worker AV-HuBERT tách môi trường fairseq khỏi FATE/transformers."""
+"""Worker AV-HuBERT tách môi trường fairseq khỏi transformers của môi trường chính."""
 
 import json
 import sys
@@ -41,7 +41,7 @@ class AVHubertVideoEncoder:
                         ("output_stride", 5),
                     )
                 },
-                format="avhubert-native-v1",
+                format="avhubert-native-v2",
             )
         )
 

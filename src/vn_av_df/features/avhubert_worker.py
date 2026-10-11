@@ -188,6 +188,8 @@ def extract(state, request):
     valid &= weights > 0
     if not np.isfinite(af).all() or not np.isfinite(vf).all():
         raise ValueError("Nonfinite AV-HuBERT output")
+    # Đường bao tiếng (RMS mỗi frame 40 ms) và landmark thô cho nhánh sớm–muộn của TriCue.
+    envelope = np.sqrt(np.square(pcm[: len(frames) * 640].reshape(len(frames), 640)).mean(1))
     output = Path(request["output"])
     save_npz(
         output,
@@ -198,11 +200,13 @@ def extract(state, request):
         visual_valid=valid,
         support_s=support,
         mouth_boxes=mouth_boxes,
+        landmarks=landmarks.astype(np.float16),
+        envelope=envelope.astype(np.float32),
     )
     write_json(
         output.with_suffix(".json"),
         dict(
-            format="avhubert-native-v1",
+            format="avhubert-native-v2",
             step_s=0.04,
             output_stride=cfg.get("output_stride", 5),
             window_s=chunk / 25,

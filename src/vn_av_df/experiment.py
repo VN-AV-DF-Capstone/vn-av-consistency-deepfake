@@ -6,6 +6,7 @@ import math
 import random
 import time
 from collections import Counter, defaultdict
+from fnmatch import fnmatch
 from pathlib import Path
 
 import numpy as np
@@ -22,20 +23,27 @@ from vn_av_df.dataset import (
     training_dataset,
 )
 from vn_av_df.features.registry import (
-    artifact_arrays,
+    assemble,
     combined_signature,
-    feature_arrays,
     make_encoder,
     method_config,
 )
-from vn_av_df.metrics import binary_metrics, choose_threshold, intervals, temporal_ap
+from vn_av_df.metrics import (
+    binary_metrics,
+    choose_threshold,
+    diagnostic_summary,
+    intervals,
+    localization_check,
+    temporal_ap,
+)
 from vn_av_df.models import build_model, output_valid, pool_score
 
-FORMAT = "vn-av-df-temporal-v1"
+FORMAT = "vn-av-df-temporal-v2"
+STAGED = ("tricue", "artifact")  # Học từng nhánh rồi hợp điểm (tricue.train_stages).
 
 
 def prediction_records(predictions):
-    """Lưu đủ nhãn/timeline để vẽ báo cáo hoặc so sánh offline từ ZIP, không cần video."""
+    """Lưu đủ nhãn/timeline để vẽ báo cáo hoặc so sánh offline, không cần video."""
     return [
         dict(
             sample_id=p["row"]["sample_id"],
@@ -49,6 +57,7 @@ def prediction_records(predictions):
             speaker_id=p["row"].get("speaker_id"),
             generator=p["row"].get("generator"),
             variant=p["row"].get("variant"),
+            diagnostic=p["row"].get("diagnostic"),
             duration_s=p["row"]["duration_s"],
             fake_intervals=p["row"]["fake_intervals"],
             av_mismatch_intervals=p["row"].get("av_mismatch_intervals"),
@@ -68,7 +77,7 @@ def save_checkpoint(path, state):
     atomic_bytes(path, stream.getvalue())
 
 
-ENCODER_CACHES = ("fate", "avhubert", "dinov2")  # Thứ tự trích: DINOv2 cần hộp miệng AV-HuBERT.
+ENCODER_CACHES = ("avhubert", "dinov2")  # Thứ tự trích: DINOv2 cần hộp miệng AV-HuBERT.
 
 
 def attach_caches(sources, target, writable=()):
@@ -100,6 +109,11 @@ def attach_caches(sources, target, writable=()):
     return found
 
 
+def needs_primary(row):
+    """MechFake ngoài tập con hợp điểm chỉ trích DINOv2 (hộp miệng lấy từ clip gốc)."""
+    return row.get("feature_scope", "full") != "artifact"
+
+
 def prepare(cfg):
     """Trích mỗi backbone một lần; test chỉ được extract, không fit thống kê.
 
@@ -117,7 +131,7 @@ def prepare(cfg):
                 "cache": scoped.pop("artifact_cache", None),
             }
             scoped.pop("methods", None)
-            # Artifact P2 đọc hộp miệng từ cache encoder chính nên luôn chạy sau nó.
+            # Artifact đọc hộp miệng từ cache encoder chính nên luôn chạy sau nó.
             stages = [(spec["encoder"], scoped)]
             if artifact["encoder"]:
                 stages.append((spec["artifact_encoder"], {**scoped, **artifact}))
@@ -131,6 +145,8 @@ def prepare(cfg):
     from concurrent.futures import ThreadPoolExecutor
 
     rows, selection = training_dataset(cfg, verify_media=True)
+    if cfg["encoder"].get("kind") == "avhubert":
+        rows = [r for r in rows if needs_primary(r)]
     # Mỗi device (vd. cuda:0, cuda:1) workers_per_device encoder, mẫu chia động giữa các encoder.
     # Device không nằm trong feature signature nên cache giống nhau dù trích ở GPU nào.
     # workers_per_device > 1 khi phần chậm chạy CPU một luồng (dlib của AV-HuBERT).
@@ -156,10 +172,10 @@ def prepare(cfg):
         try:
             for row in group:
                 tick = time.perf_counter()
-                encoder.extract(
-                    {"video": str(media_path(cfg["dataset"], row))},
-                    Path(cfg["cache"]) / (row["sample_id"] + ".npz"),
-                )
+                request = {"video": str(media_path(cfg["dataset"], row))}
+                if row.get("box_sample_id"):
+                    request["box_sample_id"] = row["box_sample_id"]
+                encoder.extract(request, Path(cfg["cache"]) / (row["sample_id"] + ".npz"))
                 with guard:
                     progress["done"] += 1
                     done, spent = progress["done"], time.perf_counter() - start
@@ -198,7 +214,7 @@ def prepare(cfg):
             "samples": len(rows),
             "dataset_selection": selection,
             "elapsed_s": elapsed,
-            "device": cfg["encoder"]["device"],
+            "device": cfg["encoder"].get("device"),
             "devices": devices,
             "feature_signature": signature,
             "note": "Includes loading, decoding and reusable-cache checks",
@@ -207,21 +223,42 @@ def prepare(cfg):
     return {"samples": len(rows), "elapsed_s": elapsed}
 
 
-def cached(row, cfg, device):
-    """Kiểm hash rồi chuyển native features thành input và grid output của model."""
-    path = Path(cfg["cache"]) / (row["sample_id"] + ".npz")
+def checked_meta(path, expected):
+    """Meta cache của đúng media; lỗi rõ nếu thiếu hoặc lệch."""
     if not path.with_suffix(".json").is_file():
         raise FileNotFoundError(
             f"Thiếu feature cache {path.with_suffix('.json')}: bước prepare chưa chạy xong "
             "(lỗi/bị dừng giữa chừng hoặc khác dữ liệu/encoder). Chạy lại prepare đến hết rồi train."
         )
     meta = read_json(path.with_suffix(".json"))
-    expected = fingerprint({"assets": {"video": row["sha256"]}, "variant": {"kind": "clean"}})
     if meta["feature_sha256"] != sha(path) or meta["source_fingerprint"] != expected:
         raise ValueError("Stale/corrupt feature cache or media provenance")
-    (audio, visual, valid), times, meta = feature_arrays(
-        path, meta, cfg.get("model_architecture", "gru")
-    )
+    return meta
+
+
+def cached(row, cfg, device, need_primary=True):
+    """Kiểm hash rồi ghép feature thành input model và lưới ô output.
+
+    need_primary=False: cho phép mẫu chỉ có cache artifact (MechFake ngoài tập con hợp điểm).
+    """
+    expected = fingerprint({"assets": {"video": row["sha256"]}, "variant": {"kind": "clean"}})
+    path = Path(cfg["cache"]) / (row["sample_id"] + ".npz")
+    primary = None
+    if needs_primary(row) or need_primary:
+        primary = (path, checked_meta(path, expected))
+    artifact = None
+    if cfg.get("artifact_cache"):
+        extra = Path(cfg["artifact_cache"]) / (row["sample_id"] + ".npz")
+        extra_meta = checked_meta(extra, expected)
+        # Hộp miệng phải đúng cache AV-HuBERT đã dùng lúc trích (của mẫu hoặc clip gốc).
+        box_sid = extra_meta.get("box_sample_id") or row["sample_id"]
+        box_meta = read_json(Path(cfg["cache"]) / (box_sid + ".json"))
+        if extra_meta["box_sha256"] != box_meta["feature_sha256"]:
+            raise ValueError("Artifact cache was cut with other mouth boxes")
+        artifact = (extra, extra_meta)
+    elif primary is None:
+        raise ValueError("Model without artifact encoder needs the primary cache")
+    tensors, times, meta = assemble(cfg.get("model_architecture", "tcn"), primary, artifact)
     if (
         not len(times)
         or not np.allclose(np.diff(times), meta["step_s"])
@@ -229,26 +266,19 @@ def cached(row, cfg, device):
         or abs(meta["duration_s"] - row["duration_s"]) > 0.1
     ):
         raise ValueError("Cache timeline differs from labeled video")
-    arrays = [audio, visual, valid]
-    if cfg.get("artifact_cache"):
-        # P2: DINOv2 miệng phải thuộc đúng video và đúng cache hộp miệng AV-HuBERT.
-        extra = Path(cfg["artifact_cache"]) / (row["sample_id"] + ".npz")
-        extra_meta = read_json(extra.with_suffix(".json"))
-        if (
-            extra_meta["feature_sha256"] != sha(extra)
-            or extra_meta["source_fingerprint"] != expected
-            or extra_meta["box_sha256"] != meta["feature_sha256"]
-        ):
-            raise ValueError("Stale/corrupt artifact cache or media provenance")
-        artifact, artifact_valid = artifact_arrays(extra, extra_meta, len(audio))
-        arrays = [audio, visual, valid & artifact_valid, artifact]
-        meta = {
-            **meta,
-            "feature_signature": combined_signature(
-                meta["feature_signature"], extra_meta["feature_signature"]
-            ),
-        }
-    tensors = [torch.as_tensor(x, device=device) for x in arrays]
+    primary_signature = primary[1]["feature_signature"] if primary else None
+    artifact_signature = artifact[1]["feature_signature"] if artifact else None
+    meta = {
+        **meta,
+        "feature_sha256": primary[1]["feature_sha256"] if primary else None,
+        "artifact_sha256": artifact[1]["feature_sha256"] if artifact else None,
+        "primary_signature": primary_signature,
+        "artifact_signature": artifact_signature,
+        "feature_signature": combined_signature(primary_signature, artifact_signature)
+        if primary
+        else None,
+    }
+    tensors = [None if x is None else torch.as_tensor(x, device=device) for x in tensors]
     target = torch.as_tensor(temporal_targets(row, times, meta["step_s"]), device=device)
     return tensors, target, times, meta
 
@@ -286,7 +316,7 @@ def training_loss(model, logits, valid, target, row, options):
 
 
 def branch_reports(groups, top_fraction):
-    """AUC không ngưỡng của từng nhánh P2: real gốc (0) so với từng ô 2×2 (1)."""
+    """AUC không ngưỡng của từng nhánh/đầu ra phụ: real gốc (0) so với từng ô 2×2 (1)."""
     from sklearn.metrics import average_precision_score, roc_auc_score
 
     names = sorted({k for items in groups.values() for p in items for k in p["branches"]})
@@ -343,8 +373,9 @@ def predict_rows(model, rows, cfg):
     results = []
     losses = []
     device = cfg["device"]
+    need = cfg.get("model_architecture") != "artifact"
     for row in rows:
-        tensors, target, times, meta = cached(row, cfg, device)
+        tensors, target, times, meta = cached(row, cfg, device, need)
         if str(device).startswith("cuda"):
             torch.cuda.synchronize()
         start = time.perf_counter()
@@ -456,10 +487,50 @@ def summarize(results, thresholds):
     }
 
 
+def trainable(row, allowed):
+    """Train/val: real/sham luôn giữ; fake chỉ của generator method cho phép; chẩn đoán thì không."""
+    if row.get("diagnostic"):
+        return False
+    if row["label"] == 0 or allowed is None:
+        return True
+    return any(fnmatch(row["generator"], pattern) for pattern in allowed)
+
+
+def model_options(cfg, head):
+    """Tham số dựng model ngoài kích thước feature (ghi vào checkpoint)."""
+    if head == "tricue":
+        from vn_av_df.tricue import BRANCHES
+
+        return {"branches": list(cfg.get("branches") or BRANCHES), **cfg.get("tricue", {})}
+    return {}
+
+
+def validation_report(model, rows, cfg):
+    """Dự đoán validation, khoá ngưỡng, báo cáo theo ô/nhánh."""
+    prediction, loss = predict_rows(model, rows, cfg)
+    thresholds = calibrate(prediction)
+    report = summarize(prediction, thresholds)
+    report["by_condition"], report["branches"] = breakdown(
+        prediction, thresholds, cfg["training"]["top_fraction"]
+    )
+    cells = {}
+    for cell, metrics in report["by_condition"].items():
+        key = "auc" if cell not in ("real", "sham") else "false_alarm"
+        cells[f"validation_{key}/{cell}"] = metrics["video"][
+            "roc_auc" if key == "auc" else "false_alarm_rate"
+        ]
+    for branch, values in ((report["branches"] or {}).get("scores") or {}).items():
+        for cell, metrics in values.items():
+            cells[f"branch_auc/{branch}/{cell}"] = metrics["roc_auc"]
+    return prediction, loss, thresholds, report, cells
+
+
 def train_one(cfg, architecture, seed, resume=False):
-    """Một method/seed: real reconstruction (nếu P1), supervised head, validation."""
+    """Một method/seed: các stage học từ real (nếu có), head có giám sát, validation."""
     cfg = method_config(cfg, architecture)
     head = cfg["model_architecture"]
+    staged = head in STAGED
+    need = head != "artifact"
     torch.set_num_threads(cfg["training"].get("torch_threads", 2))
     torch.manual_seed(seed)
     random.seed(seed)
@@ -468,42 +539,60 @@ def train_one(cfg, architecture, seed, resume=False):
         torch.cuda.reset_peak_memory_stats()
     rows, selection = training_dataset(cfg)
     rows = protocol_rows(rows, cfg.get("held_out_generators", []))
-    train = [r for r in rows if r["split"] == "train"]
-    val = [r for r in rows if r["split"] == "validation"]
+    allowed = cfg.get("train_generators")
+    train = [r for r in rows if r["split"] == "train" and trainable(r, allowed)]
+    val = [r for r in rows if r["split"] == "validation" and trainable(r, allowed)]
+    if not staged:
+        train = [r for r in train if needs_primary(r)]
+        val = [r for r in val if needs_primary(r)]
     for name, subset in (("train", train), ("validation", val)):
         if {r["label"] for r in subset} != {0, 1}:
             raise ValueError(f"Need real and fake in {name}")
-    signatures = set()
+    primary_signatures, artifact_signatures = set(), set()
     cache_hashes = []
-    first = None
+    dims = {}
+    native_stride = 1
     for r in train + val:
-        tensors, _, _, meta = cached(r, cfg, "cpu")
-        signatures.add(meta["feature_signature"])
-        cache_hashes.append(meta["feature_sha256"])
-        first = tensors if first is None else first
-    if len(signatures) != 1:
+        tensors, _, _, meta = cached(r, cfg, "cpu", need and not staged)
+        if meta["primary_signature"]:
+            primary_signatures.add(meta["feature_signature"])
+            dims.setdefault("audio", tensors[0].shape[-1])
+            dims.setdefault("visual", tensors[1].shape[-1])
+        if meta["artifact_signature"]:
+            artifact_signatures.add(meta["artifact_signature"])
+            dims.setdefault("artifact", tensors[3].shape[-1])
+        cache_hashes.append([meta["feature_sha256"], meta["artifact_sha256"]])
+        native_stride = meta.get("native_stride", 1)
+    if len(primary_signatures) > 1 or len(artifact_signatures) > 1:
         raise ValueError("Mixed encoder versions in cache")
+    signature = next(iter(primary_signatures), None) or next(iter(artifact_signatures))
     options = cfg["training"]
     if options["epochs"] < 1:
         raise ValueError("epochs must be positive")
     if not 0 < options["top_fraction"] <= 1:
         raise ValueError("top_fraction must be in (0,1]")
     model = build_model(
-        first[0].shape[-1],
-        first[1].shape[-1],
+        dims.get("audio", 0),
+        dims.get("visual", 0),
         head,
         options["hidden"],
         options["dropout"],
-        native_stride=meta.get("native_stride", 1),
-        **({"artifact_dim": first[3].shape[-1]} if len(first) > 3 else {}),
+        native_stride=native_stride,
+        **({"artifact_dim": dims["artifact"]} if "artifact" in dims else {}),
+        **model_options(cfg, head),
     ).to(cfg["device"])
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=options["lr"],
-        weight_decay=options["weight_decay"],
-    )
     out = Path(cfg["runs"]) / f"{architecture}_seed{seed}"
     out.mkdir(parents=True, exist_ok=True)
+    implementation = (
+        "experiment.py",
+        "models.py",
+        "reconstruction.py",
+        "syncartifact.py",
+        "tricue.py",
+        "dataset.py",
+        "metrics.py",
+        "features/registry.py",
+    )
     run_id = fingerprint(
         {
             "rows": train + val,
@@ -512,21 +601,140 @@ def train_one(cfg, architecture, seed, resume=False):
             "options": {k: v for k, v in options.items() if k != "epochs"},
             "model": model.config,
             "seed": seed,
+            "train_generators": allowed,
             "reconstruction": cfg.get("reconstruction", {}),
             "sync": cfg.get("sync", {}),
+            "lead": cfg.get("lead", {}),
             "implementation": {
                 name: fingerprint((Path(__file__).parent / name).read_text(encoding="utf-8"))
-                for name in (
-                    "experiment.py",
-                    "models.py",
-                    "reconstruction.py",
-                    "syncartifact.py",
-                    "dataset.py",
-                    "metrics.py",
-                    "features/registry.py",
-                )
+                for name in implementation
             },
         }
+    )
+    # Số mẫu theo split/ô 2×2 (test chỉ đếm, không đọc) để biết detector train trên dữ liệu nào.
+    data = dict(sorted(Counter(f"{r['split']}/{condition(r)}" for r in rows).items()))
+    print(
+        f"Train {out.name}: {len(train)} train, {len(val)} validation, fake train "
+        f"{sorted({r['generator'] for r in train if r['label']})}",
+        flush=True,
+    )
+    common = {
+        "format": FORMAT,
+        "model_config": model.config,
+        "feature_signature": signature,
+        "encoder_config": cfg["encoder"],
+        "artifact_encoder_config": cfg.get("artifact_encoder"),
+        "method_name": architecture,
+        "train_generators": allowed,
+        "run_id": run_id,
+        "seed": seed,
+        "held_out_generators": cfg.get("held_out_generators", []),
+        "manifest_sha256": selection["manifest_sha256"],
+        "dataset_selection": selection,
+    }
+    if staged:
+        return train_staged(
+            cfg, model, train, val, out, run_id, common, data, architecture, seed, resume
+        )
+    return train_supervised(
+        cfg, model, train, val, out, run_id, common, data, architecture, seed, resume
+    )
+
+
+def train_staged(cfg, model, train, val, out, run_id, common, data, architecture, seed, resume):
+    """TriCue / nhánh dấu vết vẽ: các stage học riêng, không resume giữa stage (train rẻ)."""
+    from vn_av_df.tricue import has_primary, train_stages
+
+    best_path = out / "best.pt"
+    if best_path.exists():
+        if not resume:
+            raise FileExistsError("Run exists: set RESUME=True or choose RUN_NAME")
+        state = torch.load(best_path, map_location="cpu", weights_only=True)
+        if state["run_id"] != run_id:
+            raise ValueError("Resume configuration/data/code changed")
+        return best_path
+    tracking.start(cfg, out, architecture, seed, data)
+    began = time.perf_counter()
+
+    def load(row, need_primary=True):
+        return cached(row, cfg, cfg["device"], need_primary)
+
+    write_json(
+        out / "configuration.json",
+        {"run_id": run_id, "architecture": architecture, "seed": seed, "settings": cfg},
+    )
+    stages = train_stages(model, train, val, load, cfg, seed)
+    write_json(out / "stages.json", stages)
+    # Đánh giá validation trên mẫu chạy được cả model (TriCue cần đủ cache AV-HuBERT).
+    rows = val if model.config["architecture"] == "artifact" else [r for r in val if has_primary(r)]
+    prediction, val_loss, thresholds, report, cells = validation_report(model, rows, cfg)
+    history = [
+        {
+            "epoch": 1,
+            "validation_loss": val_loss,
+            "validation_roc_auc": report["video"]["roc_auc"],
+            "validation_f1": report["video"]["f1"],
+            "validation_pr_auc": report["video"]["pr_auc"],
+            "validation_false_alarm_rate": report["video"]["false_alarm_rate"],
+            "video_threshold": thresholds["video"],
+            "epoch_seconds": time.perf_counter() - began,
+            **cells,
+        }
+    ]
+    tracking.log("detector", history[0])
+    state = {
+        **common,
+        "state": model.state_dict(),
+        "stage_reports": stages,
+        "sync_report": stages.get("sync"),
+        "thresholds": thresholds,
+        "top_fraction": cfg["training"]["top_fraction"],
+        "epoch": 0,
+        "history": history,
+        "validation_report": report,
+    }
+    save_checkpoint(out / "last.pt", state)
+    save_checkpoint(best_path, state)
+    write_json(out / "validation.json", report)
+    write_json(out / "predictions-validation.json", prediction_records(prediction))
+    write_json(
+        out / "best.json",
+        {"epoch": 1, "validation_loss": val_loss, "thresholds": thresholds, "selection": "stages"},
+    )
+    write_json(out / "history.json", history)
+    finish_run(
+        cfg, model, out, began, {"stage_seconds": {k: v["elapsed_s"] for k, v in stages.items()}}
+    )
+    return best_path
+
+
+def finish_run(cfg, model, out, began, extra):
+    resources = {
+        "elapsed_this_session_s": time.perf_counter() - began,
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "total_head_parameters": sum(p.numel() for p in model.parameters()),
+        "device": cfg["device"],
+        "peak_gpu_bytes": torch.cuda.max_memory_allocated()
+        if str(cfg["device"]).startswith("cuda")
+        else None,
+        **extra,
+    }
+    write_json(out / "resources.json", resources)
+    tracking.finish(
+        {
+            "best_epoch": read_json(out / "best.json")["epoch"],
+            **{f"resources/{k}": v for k, v in resources.items()},
+        }
+    )
+
+
+def train_supervised(cfg, model, train, val, out, run_id, common, data, architecture, seed, resume):
+    """B-AVH (TCN) và P2: vòng epoch có giám sát, resume theo last.pt."""
+    options = cfg["training"]
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=options["lr"],
+        weight_decay=options["weight_decay"],
     )
     start = 0
     best = float("inf")
@@ -535,14 +743,6 @@ def train_one(cfg, architecture, seed, resume=False):
     reconstruction_report = sync_report = None
     if (out / "last.pt").exists() and not resume:
         raise FileExistsError("Run exists: set RESUME=True or choose RUN_NAME")
-    # Số mẫu theo split/ô 2×2 (test chỉ đếm, không đọc) để biết detector train trên dữ liệu nào.
-    data = dict(sorted(Counter(f"{r['split']}/{condition(r)}" for r in rows).items()))
-    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        f"Train {out.name}: {len(train)} train, {len(val)} validation, "
-        f"{parameters:,} tham số train được; {data}",
-        flush=True,
-    )
     tracking.start(cfg, out, architecture, seed, data)  # train_selected đóng run kể cả khi lỗi.
     if (out / "last.pt").exists():
         state = torch.load(out / "last.pt", map_location="cpu", weights_only=True)
@@ -571,28 +771,19 @@ def train_one(cfg, architecture, seed, resume=False):
             start = options["epochs"]  # Đã early stop: resume không train thêm, giữ best.pt.
     elif hasattr(model, "reconstructor"):
         from vn_av_df.reconstruction import fit_reconstruction
+        from vn_av_df.syncartifact import fit_sync
 
         def load(row):
             return cached(row, cfg, cfg["device"])
 
-        # artifact_only của P2 không dùng R/nhánh sync nên đã sẵn sàng từ đầu.
-        if not bool(model.reconstruction_ready):
-            reconstruction_report = fit_reconstruction(
-                model,
-                train,
-                val,
-                lambda row: load(row)[0],
-                cfg.get("reconstruction", options),
-                seed,
-            )
-            write_json(out / "reconstruction.json", reconstruction_report)
-        if hasattr(model, "sync_ready") and not bool(model.sync_ready):
-            from vn_av_df.syncartifact import fit_sync
-
-            sync_report = fit_sync(
-                model, train, val, load, cfg.get("sync", {}), seed, options["top_fraction"]
-            )
-            write_json(out / "sync.json", sync_report)
+        reconstruction_report = fit_reconstruction(
+            model, train, val, lambda row: load(row)[0], cfg.get("reconstruction", options), seed
+        )
+        write_json(out / "reconstruction.json", reconstruction_report)
+        sync_report = fit_sync(
+            model, train, val, load, cfg.get("sync", {}), seed, options["top_fraction"]
+        )
+        write_json(out / "sync.json", sync_report)
     began = time.perf_counter()
     write_json(
         out / "configuration.json",
@@ -626,27 +817,11 @@ def train_one(cfg, architecture, seed, resume=False):
             losses.append(float(loss.detach()))
         if not losses:
             raise ValueError("No usable training windows")
-        prediction, val_loss = predict_rows(model, val, cfg)
+        prediction, val_loss, thresholds, report, cells = validation_report(model, val, cfg)
         if val_loss is None:
             raise ValueError("No usable validation windows")
         improved = val_loss < best
         best, stale = (val_loss, 0) if improved else (best, stale + 1)
-        thresholds = calibrate(prediction)
-        report = summarize(prediction, thresholds)
-        report["by_condition"], report["branches"] = breakdown(
-            prediction, thresholds, options["top_fraction"]
-        )
-        # Theo ô 2×2: AUC fake so với real gốc; real/sham chỉ có false alarm (một lớp).
-        cells = {}
-        for cell, metrics in report["by_condition"].items():
-            key = "auc" if cell not in ("real", "sham") else "false_alarm"
-            cells[f"validation_{key}/{cell}"] = metrics["video"][
-                "roc_auc" if key == "auc" else "false_alarm_rate"
-            ]
-        # P2: AUC không ngưỡng của từng nhánh theo ô; theo dõi nhánh nào học được gì qua epoch.
-        for branch, values in ((report["branches"] or {}).get("scores") or {}).items():
-            for cell, metrics in values.items():
-                cells[f"branch_auc/{branch}/{cell}"] = metrics["roc_auc"]
         history.append(
             {
                 "epoch": epoch + 1,
@@ -669,14 +844,9 @@ def train_one(cfg, architecture, seed, resume=False):
         )
         tracking.log("detector", history[-1])
         state = {
-            "format": FORMAT,
+            **common,
             "state": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "model_config": model.config,
-            "feature_signature": next(iter(signatures)),
-            "encoder_config": cfg["encoder"],
-            "artifact_encoder_config": cfg.get("artifact_encoder"),
-            "method_name": architecture,
             "reconstruction_report": reconstruction_report,
             "sync_report": sync_report,
             "thresholds": thresholds,
@@ -689,11 +859,6 @@ def train_one(cfg, architecture, seed, resume=False):
             "cuda_rng": torch.cuda.get_rng_state_all()
             if str(cfg["device"]).startswith("cuda")
             else None,
-            "run_id": run_id,
-            "seed": seed,
-            "held_out_generators": cfg.get("held_out_generators", []),
-            "manifest_sha256": selection["manifest_sha256"],
-            "dataset_selection": selection,
             "validation_report": report,
         }
         save_checkpoint(out / "last.pt", state)
@@ -716,25 +881,17 @@ def train_one(cfg, architecture, seed, resume=False):
         if options["patience"] and stale >= options["patience"]:
             print(f"{out.name}: early stop sau {stale} epoch không cải thiện", flush=True)
             break
-    resources = {
-        "elapsed_this_session_s": time.perf_counter() - began,
-        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
-        "total_head_parameters": sum(p.numel() for p in model.parameters()),
-        "reconstruction_seconds": reconstruction_report["elapsed_s"]
-        if reconstruction_report
-        else 0,
-        "sync_seconds": sync_report["elapsed_s"] if sync_report else 0,
-        "device": cfg["device"],
-        "peak_gpu_bytes": torch.cuda.max_memory_allocated()
-        if str(cfg["device"]).startswith("cuda")
-        else None,
-    }
-    write_json(out / "resources.json", resources)
-    tracking.finish(
+    finish_run(
+        cfg,
+        model,
+        out,
+        began,
         {
-            "best_epoch": read_json(out / "best.json")["epoch"],
-            **{f"resources/{k}": v for k, v in resources.items()},
-        }
+            "reconstruction_seconds": reconstruction_report["elapsed_s"]
+            if reconstruction_report
+            else 0,
+            "sync_seconds": sync_report["elapsed_s"] if sync_report else 0,
+        },
     )
     return out / "best.pt"
 
@@ -742,9 +899,7 @@ def train_one(cfg, architecture, seed, resume=False):
 def load_model(path, device="cpu"):
     state = torch.load(path, map_location="cpu", weights_only=True)
     if state.get("format") != FORMAT:
-        raise ValueError(
-            "Need a new binary temporal checkpoint; relation-head checkpoints are incompatible"
-        )
+        raise ValueError("Need a v002 temporal checkpoint; older checkpoints are incompatible")
     model = build_model(**state["model_config"]).to(device)
     model.load_state_dict(state["state"])
     model.eval()
@@ -815,7 +970,10 @@ def train_selected(cfg, resume=False):
 
 
 def evaluate(cfg):
-    """Test với checkpoint/threshold đã khóa; chạy lại cùng protocol không đổi quyết định."""
+    """Test với checkpoint/threshold đã khóa; chạy lại cùng protocol không đổi quyết định.
+
+    Mẫu chẩn đoán (E6: xử lý không AI, nhãn 0) báo riêng, không vào chỉ số test chính.
+    """
     folder = Path(cfg["runs"])
     index_path = folder / "training.json"
     comparison = read_json(index_path)
@@ -831,23 +989,27 @@ def evaluate(cfg):
     if lock_path.exists() and read_json(lock_path) != lock:
         raise ValueError("Test protocol changed after first evaluation; use a new experiment")
     write_json(lock_path, lock)
+    tests = [r for r in all_rows if r["split"] == "test"]
+    rows = [r for r in tests if not r.get("diagnostic")]
+    diagnostics = [r for r in tests if r.get("diagnostic")]
     reports = []
-    all_predictions = {}
     for run in comparison["runs"]:
         scoped = method_config(cfg, run["architecture"])
         checkpoint = resolve_checkpoint(scoped, run["checkpoint"])
         model, state = load_model(checkpoint, cfg["device"])
         if state["manifest_sha256"] != selection["manifest_sha256"]:
             raise ValueError("Evaluation dataset differs from trained experiment")
-        rows = [r for r in all_rows if r["split"] == "test"]
+        need = scoped["model_architecture"] != "artifact"
         for row in rows:
-            _, _, _, meta = cached(row, scoped, "cpu")
-            if meta["feature_signature"] != state["feature_signature"]:
+            meta = cached(row, scoped, "cpu", need)[3]
+            if (
+                meta["feature_signature"]
+                and meta["feature_signature"] != state["feature_signature"]
+            ):
                 raise ValueError("Test encoder differs")
         eval_cfg = copy.deepcopy(scoped)
         eval_cfg["training"]["top_fraction"] = state["top_fraction"]
         predictions, _ = predict_rows(model, rows, eval_cfg)
-        all_predictions[(run["architecture"], run["seed"])] = predictions
         report = summarize(predictions, state["thresholds"])
         report["by_condition"], report["branches"] = breakdown(
             predictions, state["thresholds"], state["top_fraction"]
@@ -889,6 +1051,22 @@ def evaluate(cfg):
             )
             for g in generators
         }
+        # E7: điểm tăng đúng trong đoạn bị vẽ (fake partial) hay đều cả clip.
+        report["localization_check"] = localization_check(predictions)
+        if diagnostics:
+            # E6: xử lý không AI (dán lại miệng thật / xử lý toàn khung) có bị báo AI không.
+            extra, _ = predict_rows(model, diagnostics, eval_cfg)
+            reals = [
+                p["video_score"] >= state["thresholds"]["video"]
+                for p in predictions
+                if condition(p["row"]) == "real" and p["video_score"] is not None
+            ]
+            report["diagnostics"] = diagnostic_summary(
+                extra, state["thresholds"]["video"], float(np.mean(reals)) if reals else None
+            )
+            write_json(
+                checkpoint.parent / "predictions-diagnostics.json", prediction_records(extra)
+            )
         report.update(
             checkpoint_sha256=sha(checkpoint),
             held_out_generators=state["held_out_generators"],

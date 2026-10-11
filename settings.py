@@ -18,17 +18,24 @@ GENERATION_NAME = part_name()
 DATASET = ROOT / "datasets" / DATASET_NAME
 # "all" = mọi part đã tải vào DATASET; hoặc ["vn-av-df-data-part1", ...].
 DATASET_PARTS = [part_name()]
-# DATASET_PARTS = ["vn-av-df-data-part1", "vn-av-df-data-part2"]
-# DATASET_PARTS = "all"  # Chỉ các part đã tải/attach, không tự download.
 # Split train/validation/test đã gán ở 05_export (xem data_settings.py).
-RUN_NAME = "train_part1_run01"  # Output: runs/train_part1_run01/<model>_seed<seed>/.
+RUN_NAME = "train_part1_v002"  # Output: runs/<RUN_NAME>/<model>_seed<seed>/.
 DEVICE = "cuda"  # Kaggle GPU. Use "cpu" for a local CPU-only environment.
 RESUME = False
-# B-FATE, B-AVH (cùng AV-HuBERT, không mô hình hóa consistency) và P2 đề xuất.
-ARCHITECTURES = ["fate_gru", "avh_tcn", "p2_syncartifact"]
-# ARCHITECTURES = ["fate_gru"]  # Chỉ một kiến trúc.
-# Ablation P2 (dùng chung cache AV-HuBERT/DINOv2):
-# ARCHITECTURES = ["avh_realrecon", "p2_sync_only", "p2_artifact_only", "p2_concat"]
+MECHANISMS = ["mech_blend", "mech_lowres", "mech_vae", "mech_warp", "mech_temporal"]
+# v002 §5.2: baseline có giám sát, đề xuất TriCue và biến thể bỏ từng nhánh.
+ARCHITECTURES = [
+    "avh_tcn",
+    "p2_syncartifact",
+    "tricue_mech",
+    "tricue_w2l",
+    "tricue_mech_w2l",
+    "tricue_mech_no_lead",
+    "tricue_mech_no_sync",
+    "tricue_mech_no_art",
+]
+# v002 §5.3: chỉ nhánh dấu vết vẽ, phân tích cơ chế MechFake (rẻ).
+# ARCHITECTURES = ["art_only_m1", ..., "art_drop_m5"]  # Xem cfg["methods"].
 SEEDS = [42, 43, 44]  # Use [42] and EPOCHS=2 for a software smoke run.
 EPOCHS = 20
 HELD_OUT_GENERATORS = ["musetalk_1_5"]
@@ -41,7 +48,7 @@ MUSETALK_PYTHON = os.environ.get(
     str(ROOT / ".venv-musetalk" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")),
 )
 CHECKPOINT = None  # None dùng DEMO_METHOD + seed đầu trong training.json, không xếp hạng model.
-DEMO_METHOD = ARCHITECTURES[0]  # Hoặc chỉ rõ "avh_realrecon" nếu đã train model đó.
+DEMO_METHOD = "tricue_mech"
 
 
 def config():
@@ -56,21 +63,23 @@ def config():
         "plan": str(ROOT / "generation/plans" / f"{GENERATION_NAME}.json"),
         "generation": {
             "clips_per_split": 2,
-            "partial_seconds": [0.4, 0.8, 1.6, 2.4],
+            # Độ dài đoạn partial lấy ngẫu nhiên liên tục trong khoảng (giây), mọi generator.
+            "partial_range_s": [0.2, 3.0],
             "crf": 18,
             "max_side": 640,
-            # Thiết kế 2×2: donor = tiếng thật khác của cùng người (mối đe dọa chính, có lệch);
-            # source = vẽ theo đúng tiếng gốc (chỉ artifact), dùng làm đối chứng ở val/test.
+            # Thiết kế 2×2: donor = tiếng thật khác của cùng người; source = vẽ theo tiếng gốc.
+            # MechFake (mech_*) và chẩn đoán (diag_*) luôn giữ tiếng gốc.
             "fake_audio_modes_by_split": {
                 "train": ["donor"],
                 "validation": ["donor", "source"],
                 "test": ["donor", "source"],
             },
             "include_sham": True,  # Sham = lệch A/V không AI, nhãn AI 0; cần cùng speaker_id.
+            # Generator AI thật đứng đầu (real/sham đi kèm job đầu tiên của parent).
             "generators_by_split": {
-                "train": ["wav2lip_gan"],
-                "validation": ["wav2lip_gan"],
-                "test": ["wav2lip_gan", "musetalk_1_5"],
+                "train": ["wav2lip_gan", *MECHANISMS],
+                "validation": ["wav2lip_gan", *MECHANISMS],
+                "test": ["wav2lip_gan", "musetalk_1_5", "diag_paste", "diag_global"],
             },
         },
         "wav2lip": {
@@ -79,20 +88,10 @@ def config():
             "device": DEVICE,
             "python": sys.executable,
         },
-        "encoder": {
-            "kind": "fate",
-            "repo": str(ROOT / "external/FATE"),
-            "base": str(ROOT / "weights/pe-av-small"),
-            "adapter": str(ROOT / "weights/fate"),
+        "mechfake": {
             "face_model": str(ROOT / "weights/media/yunet.onnx"),
+            "vae": str(ROOT / "weights/sd-vae-ft-mse"),
             "device": DEVICE,
-            "precision": "float16" if DEVICE == "cuda" else "float32",
-            "window_s": 2.0,
-            "step_s": 0.2,
-            "temporal_bins": 8,
-            "min_coverage": 0.75,
-            "max_duration": 60,
-            "max_side": 640,
         },
         "device": DEVICE,
         "architectures": ARCHITECTURES,
@@ -112,11 +111,13 @@ def config():
             "torch_threads": 2,
             "balance_parents": True,
             "artifact_aux_weight": 0.5,  # P2: head phụ artifact học cùng nhãn AI theo ô.
+            "fusion_lr": 0.05,  # TriCue: head hợp điểm (vài tham số).
+            "fusion_epochs": 60,
+            "fusion_patience": 10,
         },
         "demo_output": str(ROOT / "outputs/demo"),
     }
     cfg["encoders"] = {
-        "fate": cfg["encoder"],
         "avhubert": {
             "kind": "avhubert",
             "repo": str(ROOT / "external/av_hubert"),
@@ -143,21 +144,48 @@ def config():
             "max_side": 640,  # Phải trùng AV-HuBERT để hộp miệng khớp frame.
         },
     }
+    cfg["encoder"] = cfg["encoders"]["avhubert"]
+    both = {"encoder": "avhubert", "artifact_encoder": "dinov2"}
+    w2l, mech = ["wav2lip_gan"], ["mech_*"]
     cfg["methods"] = {
-        "fate_gru": {"encoder": "fate", "architecture": "gru"},
-        "avh_tcn": {"encoder": "avhubert", "architecture": "tcn"},
-        "avh_realrecon": {"encoder": "avhubert", "architecture": "realrecon"},
+        "avh_tcn": {"encoder": "avhubert", "architecture": "tcn", "train_generators": w2l},
+        "p2_syncartifact": {**both, "architecture": "syncartifact", "train_generators": w2l},
+        "tricue_mech": {**both, "architecture": "tricue", "train_generators": mech},
+        "tricue_w2l": {**both, "architecture": "tricue", "train_generators": w2l},
+        "tricue_mech_w2l": {**both, "architecture": "tricue", "train_generators": mech + w2l},
+        "tricue_mech_no_lead": {
+            **both,
+            "architecture": "tricue",
+            "train_generators": mech,
+            "branches": ["sync", "artifact"],
+        },
+        "tricue_mech_no_sync": {
+            **both,
+            "architecture": "tricue",
+            "train_generators": mech,
+            "branches": ["lead", "artifact"],
+        },
+        "tricue_mech_no_art": {
+            **both,
+            "architecture": "tricue",
+            "train_generators": mech,
+            "branches": ["sync", "lead"],
+        },
     }
-    p2 = {"encoder": "avhubert", "artifact_encoder": "dinov2"}
-    cfg["methods"].update(
-        p2_syncartifact={**p2, "architecture": "syncartifact"},  # P2 đầy đủ, gate.
-        p2_concat={**p2, "architecture": "syncartifact_concat"},
-        p2_sync_only={**p2, "architecture": "sync_only"},
-        p2_artifact_only={**p2, "architecture": "artifact_only"},
-        p2_sync_seen_fake={**p2, "architecture": "syncartifact_unfrozen"},  # Sync học cả fake.
+    # Phân tích cơ chế: nhánh dấu vết vẽ train trên một phần MechFake (M1…M5 = MECHANISMS).
+    subsets = {"art_all": list(MECHANISMS)}  # Mốc: đủ 5 cơ chế.
+    subsets.update({f"art_only_m{i + 1}": [name] for i, name in enumerate(MECHANISMS)})
+    subsets["art_m1_m5"] = [MECHANISMS[0], MECHANISMS[4]]  # ≈ SAVe + AVPF đã công bố.
+    subsets.update(
+        {
+            f"art_drop_m{i + 1}": [m for m in MECHANISMS if m != name]
+            for i, name in enumerate(MECHANISMS)
+        }
     )
+    for name, generators in subsets.items():
+        cfg["methods"][name] = {**both, "architecture": "artifact", "train_generators": generators}
     cfg["reconstruction"] = {"epochs": 20, "lr": 3e-4, "weight_decay": 1e-4, "patience": 5}
-    # Stage S của P2: real (0), sham và real dịch lệch tiếng ±3-15 frame (1); không thấy fake.
+    # Stage S (P2 và TriCue): real (0), sham và real dịch lệch tiếng (1); không thấy fake.
     cfg["sync"] = {
         "epochs": 20,
         "lr": 3e-4,
@@ -166,6 +194,8 @@ def config():
         "shift_frames": [3, 15],
         "shift_probability": 0.5,
     }
+    cfg["tricue"] = {"max_offset": 15, "lead_window": 12, "lead_lags": 8}
+    cfg["lead"] = {"shrinkage": 0.1}
     cfg["musetalk"] = {
         "repo": str(ROOT / "external/MuseTalk"),
         "python": MUSETALK_PYTHON,

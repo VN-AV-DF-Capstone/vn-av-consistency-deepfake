@@ -1,5 +1,17 @@
 """Registry generator: tên dữ liệu phải khớp adapter và checkpoint thực tế."""
 
+MECHANISMS = ("mech_blend", "mech_lowres", "mech_vae", "mech_warp", "mech_temporal")
+DIAGNOSTICS = ("diag_paste", "diag_global")
+
+
+def generator_kind(name):
+    """ai: generator thật (worker); mech: MechFake (nhãn AI 1); diag: chẩn đoán E6 (nhãn 0)."""
+    if name.startswith("mech_"):
+        return "mech"
+    if name.startswith("diag_"):
+        return "diag"
+    return "ai"
+
 
 def generator_adapter(name):
     """Không tự thay generator khi thiếu dependency hoặc weight."""
@@ -11,6 +23,10 @@ def generator_adapter(name):
         from vn_av_df import musetalk
 
         return musetalk
+    if name in MECHANISMS or name in DIAGNOSTICS:
+        from vn_av_df import mechfake
+
+        return mechfake.Adapter(name)
     raise ValueError(f"Unsupported generator: {name}")
 
 

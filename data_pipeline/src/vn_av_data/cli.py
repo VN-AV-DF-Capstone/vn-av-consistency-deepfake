@@ -1,4 +1,4 @@
-"""Independent data preparation CLI. No Torch or FATE imports."""
+"""Independent data preparation CLI. No Torch imports."""
 
 import argparse
 import json
@@ -49,7 +49,11 @@ def main(argv=None):
                 p.add_argument("--annotations", help="JSONL: clip_id and relation_annotations")
                 p.add_argument("--part", type=int, default=1)
                 p.add_argument("--split-seed", type=int, default=42)
-                p.add_argument("--split-ratios", help='JSON, vd. {"train":0.7,...}')
+                p.add_argument("--split-ratios", help='JSON, vd. {"train":0.6,...}')
+                p.add_argument("--min-test-groups", type=int, default=5, help="Ít hơn: cảnh báo")
+                p.add_argument(
+                    "--max-clips-per-speaker", type=int, default=0, help="0 = không giới hạn"
+                )
                 p.add_argument(
                     "--split-history", nargs="*", default=[], help="split-lock part trước"
                 )
@@ -108,6 +112,8 @@ def main(argv=None):
             seed=args.split_seed,
             ratios=json.loads(args.split_ratios) if args.split_ratios else None,
             history=args.split_history,
+            min_test_groups=args.min_test_groups,
+            max_clips_per_speaker=args.max_clips_per_speaker or None,
         )
     else:
         from vn_av_data.contract import validate_bundle

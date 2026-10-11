@@ -1,5 +1,5 @@
 # conda env create -f environments/avhubert.yml
-# Worker không cài package chính: fairseq cũ không dùng chung Transformers 5 của FATE.
+# Worker không cài package chính: fairseq cũ không dùng chung Transformers 5 của env chính.
 name: vn-avhubert
 channels:
   - conda-forge

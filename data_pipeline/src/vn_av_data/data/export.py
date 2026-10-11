@@ -46,8 +46,14 @@ def export_dataset(
     seed=42,
     ratios=None,
     history=(),
+    min_test_groups=5,
+    max_clips_per_speaker=None,
 ):
-    """`part`, `seed`, `ratios`, `history` (split-lock part trước, tuỳ chọn) quyết định split."""
+    """`part`, `seed`, `ratios`, `history` (split-lock part trước, tuỳ chọn) quyết định split.
+
+    max_clips_per_speaker: giữ tối đa N clip mỗi speaker (chọn cố định theo seed) để bớt lệch.
+    Test ít hơn min_test_groups nhóm độc lập chỉ cảnh báo (part nhỏ vẫn export được).
+    """
     root, output = Path(root).resolve(), Path(output).resolve()
     if not valid_id(dataset_id):
         raise ValueError("dataset_id must contain letters, digits, underscore or hyphen")
@@ -121,7 +127,28 @@ def export_dataset(
         raise ValueError("Annotations reference clips not included in the reviewed export")
     if not rows:
         raise ValueError("No reviewed keep clips to export")
+    capped = []
+    if max_clips_per_speaker:
+        import random
+
+        order = sorted(range(len(rows)), key=lambda i: rows[i]["clip_id"])
+        random.Random(seed).shuffle(order)
+        kept, counts = set(), Counter()
+        for i in order:
+            speaker = rows[i].get("speaker_id") or rows[i]["source_id"]
+            if counts[speaker] < max_clips_per_speaker:
+                counts[speaker] += 1
+                kept.add(i)
+        capped = [rows[i]["clip_id"] for i in range(len(rows)) if i not in kept]
+        rows = [r for i, r in enumerate(rows) if i in kept]
+        media = [m for i, m in enumerate(media) if i in kept]
     rows, registry = assign_splits(rows, part, seed, ratios, history)
+    warnings = []
+    if registry["groups_by_split"].get("test", 0) < min_test_groups:
+        warnings.append(
+            f"Test chỉ có {registry['groups_by_split'].get('test', 0)} nhóm người/nguồn độc lập "
+            f"(< {min_test_groups}): kết luận về người nói mới còn yếu"
+        )
     # Dựng ở thư mục tạm để bản export dở dang không bao giờ trông như bộ dữ liệu hoàn chỉnh.
     stage = output.with_name(output.name + ".partial")
     if stage.exists():
@@ -142,16 +169,28 @@ def export_dataset(
         "exporter_sha256": sha(__file__),
         "split": {
             key: registry[key]
-            for key in ("data_part", "split_ratios", "seed", "covered_parts", "groups", "counts")
+            for key in (
+                "data_part",
+                "split_ratios",
+                "seed",
+                "covered_parts",
+                "groups",
+                "groups_by_split",
+                "counts",
+            )
         },
+        "max_clips_per_speaker": max_clips_per_speaker,
     }
     write_json(stage / "dataset_info.json", info)
     _, report = validate_bundle(stage, probe=probe)
     report.update(
         splits=registry["counts"],
         split_groups=registry["groups"],
+        split_groups_by_split=registry["groups_by_split"],
         decisions=dict(Counter(e.get("decision") for e in entries)),
         duplicate_clips_skipped=duplicates,
+        clips_capped_per_speaker=capped,
+        warnings=warnings,
     )
     write_json(stage / "quality_report.json", report)
     if output.exists():

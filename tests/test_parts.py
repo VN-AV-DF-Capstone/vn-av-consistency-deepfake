@@ -131,10 +131,10 @@ def test_optional_registry_keeps_source_hash_identity_and_checks_preceding_part(
     assert load_history([path], 2)[0] == history
 
 
-def test_independent_split_uses_70_15_15_without_breaking_speaker_groups():
+def test_independent_split_uses_60_15_25_without_breaking_speaker_groups():
     rows = [clean(i, speaker=f"person{i // 2}") for i in range(200)]
     assigned = split_clean(rows)
-    assert Counter(r["split"] for r in assigned) == {"train": 140, "validation": 30, "test": 30}
+    assert Counter(r["split"] for r in assigned) == {"train": 120, "validation": 30, "test": 50}
     speakers = {}
     for row in assigned:
         speakers.setdefault(row["speaker_id"], set()).add(row["split"])

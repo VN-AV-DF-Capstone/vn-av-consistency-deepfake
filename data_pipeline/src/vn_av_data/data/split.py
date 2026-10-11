@@ -12,7 +12,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 SPLITS = ("train", "validation", "test")
-DEFAULT_SPLIT_RATIOS = {"train": 0.7, "validation": 0.15, "test": 0.15}
+DEFAULT_SPLIT_RATIOS = {"train": 0.6, "validation": 0.15, "test": 0.25}
 REGISTRY_SCHEMA = "vn-av-df-split-registry-v1"
 
 
@@ -125,7 +125,7 @@ def load_history(paths, part):
 
 
 def split_clean(rows, seed=42, history=(), ratios=None):
-    """Chia theo nhóm liên thông, tỷ lệ mặc định 70/15/15; chỉ giữ split part cũ khi có history."""
+    """Chia theo nhóm liên thông, tỷ lệ mặc định 60/15/25; chỉ giữ split part cũ khi có history."""
     ratios = split_ratios(ratios)
     current = [{**r, "sample_id": r["clip_id"]} for r in rows]
     ids = {r["clip_id"] for r in current}
@@ -177,6 +177,7 @@ def assign_splits(rows, part, seed=42, ratios=None, history_paths=()):
     assigned = {r["clip_id"]: r["split"] for r in split_clean(rows, seed, history, ratios)}
     rows = [{**r, "split": assigned[r["clip_id"]]} for r in rows]
     everything = [*history, *({**r, "sample_id": r["clip_id"]} for r in rows)]
+    groups = connected_groups(everything)
     registry = {
         "schema": REGISTRY_SCHEMA,
         "data_part": part,
@@ -184,7 +185,9 @@ def assign_splits(rows, part, seed=42, ratios=None, history_paths=()):
         "seed": seed,
         "covered_parts": sorted({*covered, part}),
         "assignments": everything,
-        "groups": len(connected_groups(everything)),
+        "groups": len(groups),
+        # Số nhóm người/nguồn độc lập theo split: test cần đủ nhóm để kết luận về người mới.
+        "groups_by_split": dict(Counter(group[0]["split"] for group in groups)),
         "counts": dict(Counter(r["split"] for r in [*history, *rows])),
         "note": "Source/identity grouped; channel-disjointness and near-duplicate review required separately",
     }

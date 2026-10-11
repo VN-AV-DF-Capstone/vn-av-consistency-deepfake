@@ -77,16 +77,23 @@ class DinoMouthEncoder:
         return torch.cat([tokens[:, 0], tokens[:, 1:].mean(1)], -1).cpu().numpy()
 
     def extract(self, row, output):
-        """row['boxes'] hoặc box_cache/<tên output>: cache AV-HuBERT của cùng video."""
+        """Hộp miệng: row['boxes'], box_cache/<tên output> (cache AV-HuBERT của cùng video),
+        hoặc box_cache/<box_sample_id> (clip real gốc) cho MechFake không trích AV-HuBERT —
+        mặt giữ nguyên vị trí khi chỉ vùng miệng bị thay.
+        """
         from vn_av_df.data.media import decode
 
         output = Path(output)
         video = require_file(row["video"], "video")
-        boxes_path = Path(row.get("boxes") or Path(self.cfg["box_cache"]) / output.name)
-        box_meta = read_json(boxes_path.with_suffix(".json"))
         source = fingerprint({"assets": {"video": sha(video)}, "variant": {"kind": "clean"}})
-        if box_meta["source_fingerprint"] != source or box_meta["feature_sha256"] != sha(
-            boxes_path
+        boxes_path = Path(row.get("boxes") or Path(self.cfg["box_cache"]) / output.name)
+        borrowed = None
+        if not row.get("boxes") and not boxes_path.is_file() and row.get("box_sample_id"):
+            borrowed = row["box_sample_id"]
+            boxes_path = Path(self.cfg["box_cache"]) / (borrowed + ".npz")
+        box_meta = read_json(boxes_path.with_suffix(".json"))
+        if box_meta["feature_sha256"] != sha(boxes_path) or (
+            borrowed is None and box_meta["source_fingerprint"] != source
         ):
             raise ValueError("Mouth boxes are stale or belong to another video")
         if output.is_file() and output.with_suffix(".json").is_file():
@@ -133,6 +140,7 @@ class DinoMouthEncoder:
             feature_sha256=sha(output),
             source_fingerprint=source,
             box_sha256=box_meta["feature_sha256"],
+            box_sample_id=borrowed,
             crop_size=self.crop,
         )
         write_json(output.with_suffix(".json"), meta)

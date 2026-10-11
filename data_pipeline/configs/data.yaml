@@ -4,9 +4,11 @@ curation:
   min_seconds: 5.0  # Bằng ngưỡng parent sinh fake (generation.py); clip ngắn hơn không dùng được.
   max_seconds: 8.0
   overlap_seconds: 1.0
+  merge_silence_seconds: 0.6  # v002: gộp lặng ngắn hơn ngưỡng này (v001 0.3 s tách vụn câu nói).
   sample_fps: 4.0
   scan_max_side: 640
   min_face_size: 64
   min_face_ratio: 0.9
+  every_frame_face: true  # v002: cửa sổ đã qua quét 4 fps phải có đúng một mặt ở MỌI frame.
   scene_correlation: 0.55
   max_source_hours: 12

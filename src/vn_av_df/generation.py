@@ -21,6 +21,7 @@ from vn_av_df.data.groups import read_manifest, write_manifest
 from vn_av_df.data.media import decode, probe
 from vn_av_df.data.render import encode
 from vn_av_df.dataset import SCHEMA, validate_rows
+from vn_av_df.generators import generator_kind
 
 AUDIO_MODES = ("source", "donor")
 
@@ -101,22 +102,39 @@ def make_plan(cfg):
         )
         if not generators or len(set(generators)) != len(generators):
             raise ValueError("Need unique generators per split")
-        first = True
+        if generator_kind(generators[0]) != "ai":
+            raise ValueError("First generator of a split must be a real AI generator (emits real)")
+        mechanisms = [g for g in generators if generator_kind(g) == "mech"]
+        # Mỗi parent một cơ chế MechFake (xoay vòng theo clip) được trích đủ AV-HuBERT để train
+        # head hợp điểm; cơ chế còn lại chỉ cần DINOv2 (hộp miệng lấy từ real của parent).
+        fusion = (
+            mechanisms[int(fingerprint(row["clip_id"])[:8], 16) % len(mechanisms)]
+            if mechanisms
+            else None
+        )
+        first, parent_jobs = True, []
         for name in generators:
-            for mode in modes:
-                jobs.append(
-                    {
-                        "original": row,
-                        "donor": donor if mode == "donor" else row,
-                        "generator": name,
-                        "audio_mode": mode,
-                        "emit_real": first,
-                        "sham_donor": sham_donor
-                        if first and cfg["generation"].get("include_sham", False)
-                        else None,
-                    }
-                )
+            # MechFake và chẩn đoán luôn giữ tiếng gốc.
+            for mode in modes if generator_kind(name) == "ai" else ["source"]:
+                job = {
+                    "original": row,
+                    "donor": donor if mode == "donor" else row,
+                    "generator": name,
+                    "audio_mode": mode,
+                    "emit_real": first,
+                    "sham_donor": sham_donor
+                    if first and cfg["generation"].get("include_sham", False)
+                    else None,
+                }
+                if generator_kind(name) == "mech":
+                    job["fusion_subset"] = name == fusion
+                parent_jobs.append(job)
                 first = False
+        real_sample = fingerprint(parent_jobs[0])[:20] + "_real"
+        for job in parent_jobs[1:]:
+            if generator_kind(job["generator"]) != "ai":
+                job["real_sample_id"] = real_sample
+        jobs.extend(parent_jobs)
     if not jobs or (
         not history and {j["original"]["split"] for j in jobs} != {"train", "validation", "test"}
     ):
@@ -134,15 +152,29 @@ def make_plan(cfg):
         "skipped_without_donor": skipped,
     }
     write_json(dest, plan)
-    total = sum(
-        2 + int(j.get("emit_real", True)) + int(j.get("sham_donor") is not None) for j in jobs
-    )
+    total = sum(len(job_kinds(j)) for j in jobs)
     return {
         "pairs": len(jobs),
         "videos": total,
         "splits": plan["split_counts"],
         "skipped_without_donor": len(skipped),
     }
+
+
+def job_kinds(job):
+    """Video sinh ra của một job: chẩn đoán chỉ bản xử lý cả clip; còn lại full + partial."""
+    if generator_kind(job.get("generator", "wav2lip_gan")) == "diag":
+        return ["full"]
+    kinds = (["real"] if job.get("emit_real", True) else []) + ["full", "partial"]
+    return kinds + (["sham"] if job.get("sham_donor") else [])
+
+
+def partial_frames(config, rng, n):
+    """Độ dài đoạn partial (frame 25 Hz) lấy ngẫu nhiên liên tục trong partial_range_s."""
+    low, high = config["partial_range_s"]
+    if not 0 < low <= high:
+        raise ValueError("partial_range_s must be [min, max] seconds with 0 < min <= max")
+    return max(1, min(n - 2, round(rng.uniform(low, high) * 25)))
 
 
 def compose_partial(original, fake, span):
@@ -316,9 +348,7 @@ def generate(cfg, generator=None):
             return None
         try:
             tick = time.monotonic()
-            kinds = (["real"] if job.get("emit_real", True) else []) + ["full", "partial"]
-            if job.get("sham_donor"):
-                kinds.append("sham")
+            kinds = job_kinds(job)
             dests = {kind: out / "clips" / f"{key}_{kind}.mp4" for kind in kinds}
             # Có video mà chưa có record = cặp bị ngắt giữa chừng (hết giờ phiên): xoá, sinh lại.
             for stale in dests.values():
@@ -385,12 +415,10 @@ def generate(cfg, generator=None):
                 fake["pcm"] = donor_audio[: len(original["pcm"])].copy()
             n = len(original["frames"])
             rng = random.Random(plan["seed"] + number)
-            # Cover short and longer events; manipulation extent is measured at 25 fps.
-            length = min(n - 2, round(rng.choice(plan["config"]["partial_seconds"]) * 25))
-            if length < 1:
-                raise ValueError("partial_seconds must be positive")
+            # Độ dài ngẫu nhiên liên tục: model không học thuộc vài độ dài cố định.
+            length = partial_frames(plan["config"], rng, n)
             a = rng.randrange(1, n - length)
-            partial_frames, partial_audio, spans = compose_partial(original, fake, (a, a + length))
+            partial_video, partial_audio, spans = compose_partial(original, fake, (a, a + length))
             sham_audio = original["pcm"].copy()
             if job.get("sham_donor"):
                 # Ghép âm thanh thu thật, hình không AI: đối chứng dấu vết splice và lệch A/V.
@@ -403,15 +431,20 @@ def generate(cfg, generator=None):
                     raise ValueError("Sham donor too short")
                 sham_audio[a * 1920 : (a + length) * 1920] = genuine[a * 1920 : (a + length) * 1920]
             generated = []
+            family = generator_kind(name)
             for kind, frames, pcm, intervals in (
                 ("real", original["frames"], original["pcm"], []),
                 ("full", fake["frames"], fake["pcm"], [[0, n / 25]]),
-                ("partial", partial_frames, partial_audio, spans),
+                ("partial", partial_video, partial_audio, spans),
                 ("sham", original["frames"], sham_audio, []),
             ):
                 if kind not in dests:
                     continue
-                is_fake = kind in {"full", "partial"}
+                # Chẩn đoán E6: xử lý không AI, nhãn 0, không có đoạn fake.
+                is_fake = kind in {"full", "partial"} and family != "diag"
+                diagnostic = family == "diag" and kind == "full"
+                if diagnostic:
+                    intervals = []
                 encode(frames, pcm, dests[kind], plan["config"]["crf"])
                 if abs(probe(dests[kind])["duration_s"] - n / 25) > 0.1:
                     raise ValueError("Encoded duration differs")
@@ -485,6 +518,23 @@ def generate(cfg, generator=None):
                         "group_id": key,
                     }
                 )
+                row = generated[-1]
+                if family != "ai" and (is_fake or diagnostic):
+                    row["generator"] = name
+                if diagnostic:
+                    row.update(
+                        generator_version=gen_info["version"],
+                        variant="diagnostic",
+                        diagnostic=name.removeprefix("diag_"),
+                        av_mismatch_intervals=[],
+                    )
+                if family == "mech":
+                    row.update(
+                        # Chỉ M5 làm miệng lệch tiếng; cơ chế khác giữ đúng hình dạng miệng.
+                        av_mismatch_intervals=intervals if name == "mech_temporal" else [],
+                        feature_scope="full" if job.get("fusion_subset") else "artifact",
+                        box_sample_id=job["real_sample_id"],
+                    )
             write_json(record, generated)
         finally:
             slots.put(gpu)
@@ -558,6 +608,12 @@ def generate(cfg, generator=None):
             "theo remaining_by_generator rồi chạy tiếp",
         }
     rows = [row for result in results for row in result]
+    # MechFake lấy hộp miệng từ real của parent: cặp AI của parent bị bỏ thì bỏ luôn MechFake.
+    produced = {row["sample_id"] for row in rows}
+    orphans = [r for r in rows if r.get("box_sample_id") and r["box_sample_id"] not in produced]
+    if orphans:
+        print(f"Bỏ {len(orphans)} mẫu MechFake vì parent không có real (cặp AI bị bỏ)", flush=True)
+        rows = [r for r in rows if r not in orphans]
     write_manifest(out / "candidates.jsonl", rows)
     write_json(out / "skipped_pairs.json", skipped)
     if not (out / "review.csv").exists():

@@ -15,8 +15,11 @@ generate/train chỉ đọc lại. Đổi tỷ lệ/seed thì export lại part 
 
 DATASET_NAME = "vn-av-df-data"
 PART = 1  # Ví dụ: 1 -> part1; 2 -> part2. Không đổi ID người/nguồn theo số part.
-# Tạm 70/15/15: part 1 (10 speaker) chia 80/10/10 thì validation chỉ có 1 người.
-SPLIT_RATIOS = {"train": 0.7, "validation": 0.15, "test": 0.15}
+# v002: 60/15/25 để test đủ người (mục tiêu ≥ MIN_TEST_GROUPS nhóm độc lập; part nhỏ chỉ cảnh báo).
+SPLIT_RATIOS = {"train": 0.6, "validation": 0.15, "test": 0.25}
+MIN_TEST_GROUPS = 5
+# None = giữ mọi clip; số nguyên = tối đa bấy nhiêu clip mỗi speaker (chọn cố định theo SPLIT_SEED).
+MAX_CLIPS_PER_SPEAKER = None
 SPLIT_SEED = 42  # Giữ cố định giữa các part.
 # Rỗng = mỗi part chia độc lập. Bật kế thừa: split-lock.json của các part trước (trong part sạch).
 SPLIT_HISTORY = []
