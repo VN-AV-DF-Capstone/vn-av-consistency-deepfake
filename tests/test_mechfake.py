@@ -38,6 +38,12 @@ def test_mechanism_changes_only_the_mouth_region(name, frames, monkeypatch):
     assert detail["region"] in ("lips", "lower")
 
 
+def test_vae_batch_shrinks_with_patch_side():
+    # Bộ nhớ đỉnh ~ số ảnh × cạnh²: giữ ngang 16 ảnh 256 px để worker khác cùng GPU còn chỗ.
+    assert [mechfake.vae_batch(s) for s in (64, 256, 320, 600, 2000)] == [16, 16, 10, 2, 1]
+    assert all(mechfake.vae_batch(s) * s * s <= 16 * 256 * 256 for s in range(256, 1025, 8))
+
+
 def test_temporal_index_is_never_identity():
     for seed in range(30):
         index, mode = mechfake.temporal_index(100, random.Random(seed))

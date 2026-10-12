@@ -27,6 +27,16 @@ from vn_av_df.generators import DIAGNOSTICS, MECHANISMS
 WORK = 256  # Cạnh patch xử lý (pixel) trước khi dán lại về kích thước thật.
 VAE_REPO = "stabilityai/sd-vae-ft-mse"
 _VAE = {}
+# Lô qua SD-VAE co theo cạnh ảnh: bộ nhớ ~ số ảnh × cạnh². Ngân sách = 16 ảnh 256 px; lô cố định
+# 16 ở cạnh ~600 px giữ ~10 GB đệm GPU (worker MuseTalk cùng GPU hết VRAM, phiên 3 part1).
+VAE_BATCH_PIXELS = 16 * 256 * 256
+
+
+def vae_batch(side):
+    """Số ảnh mỗi lượt qua VAE: 16 ở cạnh ≤ 256 px, 10 ở 320, 2 ở 600."""
+    return max(1, min(16, VAE_BATCH_PIXELS // (side * side)))
+
+
 # Clip gốc đã giải mã + điểm mặt, dùng chung cho 5 cơ chế của cùng parent (các luồng GPU cùng
 # đọc; mọi bước chỉ tạo mảng mới, không sửa frame). Giữ vài clip gần nhất cho vừa RAM.
 _SOURCES = OrderedDict()
@@ -173,13 +183,13 @@ def vae_roundtrip(patches, side, folder, device):
         dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
         _VAE[key] = AutoencoderKL.from_pretrained(str(folder), torch_dtype=dtype).to(device).eval()
     vae = _VAE[key]
-    out = []
+    out, size = [], vae_batch(side)
     with torch.no_grad():
-        for start in range(0, len(patches), 16):
+        for start in range(0, len(patches), size):
             batch = np.stack(
                 [
                     cv2.resize(p, (side, side), interpolation=cv2.INTER_AREA)
-                    for p in patches[start : start + 16]
+                    for p in patches[start : start + size]
                 ]
             )
             x = torch.from_numpy(batch[..., ::-1].copy()).permute(0, 3, 1, 2).float() / 127.5 - 1
@@ -188,6 +198,11 @@ def vae_roundtrip(patches, side, folder, device):
             images = ((decoded.float().clamp(-1, 1) + 1) * 127.5).round().byte().cpu().numpy()
             for image in images.transpose(0, 2, 3, 1)[..., ::-1]:
                 out.append(cv2.resize(image, (WORK, WORK), interpolation=cv2.INTER_LINEAR))
+            del x, decoded
+    if str(device).startswith("cuda"):
+        # Bộ đệm của PyTorch giữ hàng GB sau decode và không trả cho tiến trình khác: worker
+        # MuseTalk mở sau trên cùng GPU hết VRAM (phiên 3 part1). Trả lại sau mỗi clip.
+        torch.cuda.empty_cache()
     return np.stack(out)
 
 

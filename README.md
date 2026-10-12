@@ -40,6 +40,7 @@ Mọi notebook đọc input bằng **một đường dẫn đầy đủ** (copy 
 | Dataset tạo từ Output chỉ lấy **500 file** | Cache ~6000 file/encoder, part đã sinh hàng nghìn clip | Tải Output về, ZIP ở local rồi upload thành dataset |
 | `kaggle kernels output` chỉ lấy version mới nhất, skip chậm, đứt mạng là dừng | Tải Output lớn hay lỗi | `python tools/kaggle_pull.py <owner/slug> .. "<regex>"` (bỏ qua file đã có, tự thử lại) |
 | Kaggle CLI mới cần Python ≥ 3.11 | Env dự án v002 đã là 3.11 | `python -m pip install -U kaggle`, `kaggle auth login` |
+| `mech_vae` giữ bộ đệm GPU, worker MuseTalk mở sau trên cùng GPU báo `CUDA out of memory` (phiên 3 part1) | Đã sửa: lô VAE co theo cạnh ảnh (16 ảnh ở 256 px, 2 ở 600 px) + trả bộ đệm sau mỗi clip (`mechfake.py`, không đổi chữ ký output) | Phiên đã lỗi: chạy tiếp `GENERATORS = ["musetalk_1_5"]` với `PREVIOUS_OUTPUT` = Output phiên đó |
 
 ## Cài đặt local
 
