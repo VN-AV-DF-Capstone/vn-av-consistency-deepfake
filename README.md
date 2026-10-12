@@ -94,22 +94,22 @@ Thiết kế **2×2**:
 
 1. **Push code lên GitHub** (notebook clone `REPO_URL`), upload part sạch thành `vn-av-df-clean-partN`; trong [generate.ipynb](notebooks/generate.ipynb) đặt `PART`, `CLEAN_PART`.
 2. **Chạy thử trước:** `GENERATORS = "all"`, `CLIPS_PER_SPLIT = 2` (2 parent mỗi split, ~20 phút) để bắt lỗi trước khi chạy thật. Output chạy thử **không** dùng làm `PREVIOUS_OUTPUT` cho bản thật (plan khác).
-3. **Chạy thật** (`CLIPS_PER_SPLIT = 0`): phiên 1 và 2 chạy **song song** trên **hai notebook** (notebook `generate` và bản *Copy & Edit* của nó, vd. `generate-cpu`), phiên 3 gộp hai output rồi sinh nốt. Mọi phiên giữ nguyên mọi thông số khác (plan khoá cấu hình, lệch là báo lỗi); chỉ đổi 2 dòng:
+3. **Chạy thật** (`CLIPS_PER_SPLIT = 0`): **3 phiên độc lập**, mỗi phiên một notebook (notebook `generate` và các bản *Copy & Edit*, vd. `generate-cpu`), đều `PREVIOUS_OUTPUT = None`; tải 3 Output về rồi **gộp ở local** (`03b_merge.py`, mục 3). Mọi phiên giữ nguyên mọi thông số khác (plan khoá cấu hình); chỉ đổi `GENERATORS` và Accelerator:
 
-   | Phiên | Notebook | Accelerator | `GENERATORS` | `PREVIOUS_OUTPUT` | Part1 (ước tính) |
-   |---|---|---|---|---|---|
-   | 1 | `generate` | GPU T4 ×2 | `["wav2lip_gan"]` | `None` | 804 cặp, ~8 h |
-   | 2 (cùng lúc với 1) | `generate-cpu` | **None** (CPU, không trừ quota GPU) | `["mech_blend", "mech_lowres", "mech_warp", "mech_temporal", "diag_paste", "diag_global"]` | `None` | 1740 + 280 cặp |
-   | 3 (sau khi 1, 2 xong) | `generate` | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | `[output phiên 1, output phiên 2]` | 280 + 435 cặp |
+   | Phiên | Accelerator | `GENERATORS` | Part1 (ước tính) |
+   |---|---|---|---|
+   | 1 | GPU T4 ×2 | `["wav2lip_gan"]` | 804 cặp, ~8 h |
+   | 2 | **None** (CPU, không trừ quota GPU) | `["mech_blend", "mech_lowres", "mech_warp", "mech_temporal", "diag_paste", "diag_global"]` | 1740 + 280 cặp |
+   | 3 | GPU T4 ×2 | `["musetalk_1_5", "mech_vae"]` | 280 + 435 cặp |
 
-   - Phiên 1 và 2 tự lập plan, cùng seed + part sạch nên **trùng nhau**. `PREVIOUS_OUTPUT` là danh sách → notebook **gộp** hai output (`merge_outputs`: kiểm cùng plan, cùng chữ ký code, provenance không mâu thuẫn, hash từng video) rồi sinh nốt. Một đường dẫn = sinh tiếp như cũ.
-   - Gắn output: *Add Input → Your Work* → notebook, Kaggle lấy **version mới nhất**; trỏ tới thư mục `vn-av-df-forensics` trong đó, vd. `Path("/kaggle/input/<notebook>/vn-av-df-forensics")`. Vì vậy mỗi phiên song song một notebook riêng.
-   - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial` kèm `remaining_by_generator`: chạy lại **đúng phiên đó trong notebook của nó** với `PREVIOUS_OUTPUT` = output vừa lưu (một đường dẫn); xong hết phiên 1 và 2 mới làm phiên 3.
-   - **Không đổi code từ phiên 1 đến hết phiên 3**: `generation.json` khoá hash `generation.py`, `render.py` (và `mechfake.py` theo generator); đổi code → `Changed generation run` / không gộp được, phải sinh lại.
-   - Real/sham sinh kèm Wav2Lip (phiên 1); MechFake của parent mà cặp Wav2Lip bị bỏ (không thấy mặt) bị loại khi gộp xong.
+   - Mỗi phiên tự lập plan (cùng seed + part sạch + cấu hình → **trùng nhau**) và chỉ sinh cặp của generator phiên đó; thứ tự và chạy song song tuỳ ý. Output mỗi phiên chỉ chứa phần của nó, không trùng dữ liệu trên Kaggle.
+   - **Không đổi code từ phiên đầu đến phiên cuối**: `generation.json` khoá hash `generation.py`, `render.py` (và `mechfake.py` theo generator); lệch → không gộp được, phải sinh lại phiên đó.
+   - Hết `TIME_BUDGET_HOURS` (11 h) → `status: partial`: chạy lại **đúng phiên đó trong notebook của nó** với `PREVIOUS_OUTPUT` = Output vừa lưu (*Add Input → Your Work*, trỏ tới thư mục `vn-av-df-forensics`). Phiên xong khi `remaining_by_generator` không còn generator của nó (vẫn `partial` vì cặp của phiên khác).
+   - `PREVIOUS_OUTPUT` dạng danh sách = gộp ngay trên Kaggle (vd. phiên 3 gắn Output phiên 1 + 2 rồi sinh nốt): một Output đủ cả part, nhưng Kaggle lưu trùng dữ liệu.
+   - Real/sham sinh kèm Wav2Lip (phiên 1); MechFake của parent mà cặp Wav2Lip bị bỏ (không thấy mặt) bị loại khi gộp.
    - `DEVICE = "auto"`: không GPU thì chạy CPU với `CPU_WORKERS` (2) cặp song song; phiên CPU chỉ nhận `mech_*` trừ `mech_vae` và `diag_*`, generator khác báo lỗi ngay.
-   - Muốn gọn (một notebook, tuần tự): `GENERATORS = "all"` qua ~2 phiên GPU (~15–17 h), hoặc 3 phiên nối tiếp mỗi phiên `PREVIOUS_OUTPUT` = output phiên trước.
-   - Chạy nền: *Save Version → Save & Run All*, Output tự lưu (chạy tương tác không lưu Output). Dung lượng ~0,8 MB/mẫu (part1 ~8000 mẫu ≈ 6,5 GB, dưới giới hạn 20 GB).
+   - Muốn gọn (một notebook, tuần tự): `GENERATORS = "all"` qua ~2 phiên GPU (~15–17 h), mỗi phiên sau `PREVIOUS_OUTPUT` = Output phiên trước.
+   - Chạy nền: *Save Version → Save & Run All*, Output tự lưu (chạy tương tác không lưu Output). Dung lượng ~0,8 MB/mẫu (part1 ~8000 mẫu ≈ 6,5 GB tổng).
 4. Mặc định: Wav2Lip GAN cho mọi split, MuseTalk 1.5 chỉ ở test; train chỉ `donor`, validation/test có `donor` + `source`; fake cục bộ có **độ dài ngẫu nhiên liên tục** trong `PARTIAL_RANGE_S` (0,2–3,0 s). Clip không có donor cùng `speaker_id` bị bỏ và ghi vào plan. Generator AI thật phải đứng đầu mỗi split (sinh kèm real/sham).
 5. **MechFake** (v002, train/validation, mỗi parent đủ 5 cơ chế, tiếng gốc, không cần worker):
 
@@ -131,6 +131,7 @@ Nhãn mỗi mẫu: `label` (AI), `fake_intervals`, `audio_mode` (`donor`/`source
 
 Tải `vn-av-df-forensics/datasets/vn-av-df-data/<part>/` và `vn-av-df-forensics/generation/plans/<part>.json` về đúng chỗ, đặt `PART` trong `data_settings.py`, chạy trong `generation/`:
 
+- `03b_merge.py` (khi sinh nhiều phiên độc lập): tải Output **mỗi phiên vào một thư mục riêng**, vd. `python tools/kaggle_pull.py <user>/<notebook> ../kaggle_outputs/gpu "/datasets/|/generation/plans/"`, điền `MERGE_INPUTS` trong `settings.py` (danh sách các thư mục đó), chạy. Kiểm cùng plan, cùng chữ ký code, provenance, hash từng video; thiếu cặp thì báo theo generator và không chép gì. Ghi vào `datasets/vn-av-df-data/<part>/` (phải trống) + `generation/plans/<part>.json`, kèm `candidates.jsonl`/`review.csv`. Một Output đủ cả part (gộp trên Kaggle hoặc một notebook tuần tự) thì tải thẳng về đúng chỗ, bỏ qua bước này.
 - `04_review.py`: http://127.0.0.1:8002. **Mặc định mọi mẫu `keep`**, chỉ đánh `reject`/`uncertain` mẫu lỗi. Real gốc chiếu cạnh mẫu đang duyệt; timeline vạch đoạn fake (đỏ) và đoạn ghép tiếng của sham (cam); lọc theo split/variant/generator/audio_mode.
 - `05_finalize.py`: chốt mẫu keep (bất biến; đổi thì làm part mới).
 - `06_export.py`: tạo `datasets/vn-av-df-data/<part>.zip` → upload thành `vn-av-df-data-partN`.
@@ -227,7 +228,7 @@ Bảng mô tả tài sản được cấu hình sử dụng; không có nghĩa t
 |---|---|
 | `src/vn_av_df/` | Generation, feature, model, train/test, demo |
 | `data_pipeline/` | Thu thập, cắt, duyệt, export + split (`steps/01…05`) |
-| `generation/`, `training/` | Entrypoint local (`00…06`, `00…04`) |
+| `generation/`, `training/` | Entrypoint local (`00…06` + `03b_merge`, `00…04`) |
 | `notebooks/` | `cut`, `generate`, `prepare`, `train` (Kaggle) và `compare` |
 | `tools/` | `kaggle_pull.py` |
 | `environments/` | Worker MuseTalk / AV-HuBERT |

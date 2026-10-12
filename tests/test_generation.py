@@ -269,6 +269,66 @@ def test_parallel_sessions_merge_into_one_output(tmp_path):
         merge_outputs(bad, [gpu, (Path(other["plan"]), cpu[1])])
 
 
+def test_independent_sessions_merge_locally_then_review(tmp_path):
+    from vn_av_df.merge import merge_sessions, session_sources
+
+    root = tmp_path / "clean"
+    clean_bundle(root, [(f"s{i}", f"p{i // 2}") for i in range(6)])
+    mech = ["mech_blend", "mech_vae"]
+    base = {
+        "seed": 42,
+        "clean_dataset": str(root),
+        "generation": {
+            "clips_per_split": 1,
+            "partial_range_s": [0.2, 3.0],
+            "crf": 18,
+            "max_side": 640,
+            "generators_by_split": {s: ["wav2lip_gan", *mech] for s in ("train", "validation")}
+            | {"test": ["wav2lip_gan", "musetalk_1_5", "diag_global"]},
+        },
+    }
+    repo = tmp_path / "repo"  # Đường dẫn tương đối plan/output như trong repo và Output Kaggle.
+    plan_rel, out_rel = Path("generation/plans/part1.json"), Path("datasets/vn/part1")
+    sessions = {
+        "gpu": ["wav2lip_gan"],
+        "cpu": ["mech_blend", "diag_global"],
+        "gpu2": ["musetalk_1_5", "mech_vae"],
+    }
+    downloads = []
+    for name, generators in sessions.items():
+        # Mỗi phiên PREVIOUS_OUTPUT = None: tự lập plan, chỉ sinh cặp của mình.
+        base_dir = tmp_path / "downloads" / name / "vn-av-df-forensics"
+        cfg = {
+            **base,
+            "plan": str(base_dir / plan_rel),
+            "generated_dataset": str(base_dir / out_rel),
+            "generation_generators": generators,
+        }
+        make_plan(cfg)
+        assert generate(cfg, paint_generator)["status"] == "partial"
+        downloads.append(base_dir.parent)
+    merged = {**base, "plan": str(repo / plan_rel), "generated_dataset": str(repo / out_rel)}
+    # Thiếu phiên: báo cặp còn thiếu theo generator, không chép gì.
+    partial = session_sources(repo, merged["plan"], merged["generated_dataset"], downloads[:2])
+    with pytest.raises(ValueError, match="musetalk_1_5"):
+        merge_sessions(merged, partial)
+    assert not (repo / out_rel).exists()
+    sources = session_sources(repo, merged["plan"], merged["generated_dataset"], downloads)
+    result = merge_sessions(merged, sources)
+    jobs = read_json(repo / plan_rel)["jobs"]
+    assert result["status"] == "complete" and result["pairs"] == len(jobs)
+    log = read_json(repo / out_rel / "generation.json")
+    assert set(log["provenance"]) == {g for gs in sessions.values() for g in gs}
+    assert len(log["sessions"]) == 3
+    finalize(merged)
+    bundle = load_dataset(merged["generated_dataset"], verify_media=True)
+    assert len(bundle) == result["samples"]
+    ids = {r["sample_id"] for r in bundle}
+    assert all(r["box_sample_id"] in ids for r in bundle if r.get("box_sample_id"))
+    with pytest.raises(FileNotFoundError, match="MERGE_INPUTS"):
+        session_sources(repo, merged["plan"], merged["generated_dataset"], [tmp_path / "nope"])
+
+
 def test_generation_stops_at_deadline_and_resumes_in_parallel(tmp_path):
     import time
 

@@ -42,6 +42,13 @@ def execute(action, cfg, resume=False):
         from vn_av_df.generation import generate
 
         result = generate(cfg)
+    elif action == "merge":
+        from vn_av_df.merge import merge_sessions, session_sources
+
+        sources = session_sources(
+            cfg["root"], cfg["plan"], cfg["generated_dataset"], cfg["merge_inputs"]
+        )
+        result = merge_sessions(cfg, sources)
     elif action == "finalize":
         from vn_av_df.generation import finalize
 

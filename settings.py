@@ -22,6 +22,9 @@ DATASET_PARTS = [part_name()]
 RUN_NAME = "train_part1_v002"  # Output: runs/<RUN_NAME>/<model>_seed<seed>/.
 DEVICE = "cuda"  # Kaggle GPU. Use "cpu" for a local CPU-only environment.
 RESUME = False
+# generation/03b_merge.py: thư mục Output đã tải của từng phiên sinh (mỗi phiên một thư mục,
+# chứa vn-av-df-forensics/), vd. [ROOT.parent / "kaggle_outputs" / n for n in ("gpu", "cpu", "gpu2")].
+MERGE_INPUTS = []
 MECHANISMS = ["mech_blend", "mech_lowres", "mech_vae", "mech_warp", "mech_temporal"]
 # v002 §5.2: baseline có giám sát, đề xuất TriCue và biến thể bỏ từng nhánh.
 ARCHITECTURES = [
@@ -61,6 +64,8 @@ def config():
         "dataset": str(DATASET),
         "dataset_parts": DATASET_PARTS,
         "plan": str(ROOT / "generation/plans" / f"{GENERATION_NAME}.json"),
+        "root": str(ROOT),
+        "merge_inputs": [str(p) for p in MERGE_INPUTS],
         "generation": {
             "clips_per_split": 2,
             # Độ dài đoạn partial lấy ngẫu nhiên liên tục trong khoảng (giây), mọi generator.
