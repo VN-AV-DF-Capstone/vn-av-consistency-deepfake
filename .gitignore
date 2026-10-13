@@ -15,6 +15,7 @@ __pycache__/
 /runs/
 /datasets/
 /outputs/
+/kaggle_outputs/
 /artifacts/
 /references/*.pdf
 /generation/plans/
