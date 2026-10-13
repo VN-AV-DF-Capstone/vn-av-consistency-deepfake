@@ -152,6 +152,12 @@ python tools/kaggle_pull.py <user>/<prepare-slug> .. "/cache/"      # tải Outp
 cd cache/vn-av-df-data; tar -a -cf D:\vn-av-df-features-part1.zip avhubert dinov2   # chỉ thư mục encoder
 ```
 
+Hoặc trong File Explorer: mở `cache\vn-av-df-data\`, chọn **cùng lúc `avhubert` và `dinov2`** → *Compress to ZIP*. Quy tắc ZIP:
+
+- Tầng đầu của ZIP là **trực tiếp** `avhubert/`, `dinov2/`; không zip thư mục cha `vn-av-df-data`, không kèm `environment/` (chỉ là thông tin worker).
+- `CACHE_INPUTS` trong `train.ipynb` trỏ tới **thư mục chứa trực tiếp** `avhubert/`, `dinov2/`: ZIP đúng → `Path("/kaggle/input/datasets/<user>/vn-av-df-features-part1")`; lỡ zip cả thư mục cha → thêm `/vn-av-df-data`.
+- Upload thành dataset `vn-av-df-features-partN` (Kaggle tự giải nén). Prepare hai phiên (vd. AV-HuBERT, DINOv2 riêng) thì zip mỗi encoder riêng hoặc gộp đều được; liệt kê mọi dataset trong `CACHE_INPUTS`.
+
 ## 5. Train + test ([train.ipynb](notebooks/train.ipynb))
 
 ```python
