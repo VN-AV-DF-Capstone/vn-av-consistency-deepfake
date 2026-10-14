@@ -277,7 +277,7 @@ def project(tmp_path):
     return cfg, rows
 
 
-def test_tricue_stages_protocol_two_outputs_and_diagnostics(project):
+def test_tricue_stages_protocol_two_outputs_and_diagnostics(project, monkeypatch):
     cfg, rows = project
     train_selected(cfg)
     runs = Path(cfg["runs"])
@@ -307,6 +307,19 @@ def test_tricue_stages_protocol_two_outputs_and_diagnostics(project):
     assert set(tri["localization_check"]) == {"wav2lip_gan"}
     assert tri["localization_check"]["wav2lip_gan"]["clips"] == 3
     assert set(results["art"]["branches"]["scores"]) == {"artifact"}
+    # Báo cáo model train theo stage: history một dòng (không có train_loss), đường loss từ stages.
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    from vn_av_df.reporting import training_reports
+
+    for split in ("validation", "test"):
+        summaries = {
+            r["summary"]["architecture"]: r["summary"] for r in training_reports(runs, split)
+        }
+        assert set(summaries["tri"]["stage_epochs"]) == {"sync", "artifact", "fusion"}
+        assert (
+            summaries["tri"]["sync"]["best_validation_auc"] == stages["sync"]["best_validation_auc"]
+        )
+        assert set(summaries["art"]["stage_epochs"]) == {"artifact"}
     diagnostics = read_json(runs / "tri_seed42/predictions-diagnostics.json")
     assert {p["diagnostic"] for p in diagnostics} == {"paste"}
     with pytest.raises(FileExistsError):

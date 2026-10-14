@@ -25,28 +25,46 @@ def detector_report(folder, split="validation"):
     metrics = read_json(folder / f"{split}.json")
     predictions = read_json(folder / f"predictions-{split}.json")
     resources = read_json(folder / "resources.json")
+    # TriCue / nhánh dấu vết vẽ: từng stage học riêng (stages.json); history chỉ một dòng đánh giá.
+    stages = read_json(folder / "stages.json") if (folder / "stages.json").exists() else None
+    curves = {k: v["history"] for k, v in (stages or {}).items() if v.get("history")}
     out = folder / "report"
     out.mkdir(parents=True, exist_ok=True)
     measured = [p for p in predictions if p["video_score"] is not None]
     labels = np.array([p["label"] for p in measured])
     scores = np.array([p["video_score"] for p in measured])
-    title = (
-        f"{config['architecture']} | seed {config['seed']} | {split} | best epoch {best['epoch']}"
-    )
+    chosen = "staged" if stages else f"best epoch {best['epoch']}"
+    title = f"{config['architecture']} | seed {config['seed']} | {split} | {chosen}"
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     fig.suptitle(title)
     epochs = [h["epoch"] for h in history]
     ax = axes[0, 0]
-    ax.plot(epochs, [h["train_loss"] for h in history], marker="o", markersize=3, label="Train")
-    ax.plot(
-        epochs,
-        [h["validation_loss"] for h in history],
-        marker="o",
-        markersize=3,
-        label="Validation",
-    )
-    ax.axvline(best["epoch"], color="gray", linestyle="--", label="Best checkpoint")
-    ax.set(title="Loss per epoch", xlabel="Epoch", ylabel="Loss")
+    if stages:
+        for i, (name, rows) in enumerate(curves.items()):
+            stage_epochs = [r["epoch"] for r in rows]
+            for key, style in (("train_loss", "--"), ("validation_loss", "-")):
+                values = [r.get(key) if r.get(key) is not None else np.nan for r in rows]
+                ax.plot(
+                    stage_epochs,
+                    values,
+                    color=f"C{i}",
+                    linestyle=style,
+                    marker="o",
+                    markersize=3,
+                    label=name if style == "-" else None,
+                )
+        ax.set(title="Loss per stage (dashed = train)", xlabel="Stage epoch", ylabel="Loss")
+    else:
+        ax.plot(epochs, [h["train_loss"] for h in history], marker="o", markersize=3, label="Train")
+        ax.plot(
+            epochs,
+            [h["validation_loss"] for h in history],
+            marker="o",
+            markersize=3,
+            label="Validation",
+        )
+        ax.axvline(best["epoch"], color="gray", linestyle="--", label="Best checkpoint")
+        ax.set(title="Loss per epoch", xlabel="Epoch", ylabel="Loss")
     ax.legend()
     ax = axes[0, 1]
     for key, name in (("validation_roc_auc", "ROC-AUC"), ("validation_f1", "F1")):
@@ -174,6 +192,12 @@ def detector_report(folder, split="validation"):
         fig.savefig(stage_image, dpi=140)
         plt.close(fig)
         images.append(str(stage_image))
+    elif stages and "sync" in stages:
+        # TriCue: stage S nằm trong stages.json (đường loss đã vẽ ở ô đầu).
+        sync = {
+            k: stages["sync"].get(k)
+            for k in ("best_validation_loss", "best_validation_auc", "sham_train", "elapsed_s")
+        }
     if examples:
         fig, axes = plt.subplots(
             len(examples),
@@ -224,6 +248,7 @@ def detector_report(folder, split="validation"):
         "split": split,
         "best_epoch": best["epoch"],
         "epochs_completed": len(history),
+        "stage_epochs": {k: len(v) for k, v in curves.items()} if stages else None,
         "video_metrics": metrics["video"],
         "video_coverage": metrics["video_coverage"],
         "window_coverage": metrics["window_coverage"],
